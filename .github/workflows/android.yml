@@ -1,4 +1,4 @@
-name: Build Helen AI 4 APK
+name: Build HELEN AI 5 - Bundled Qwen3 APK
 on:
   push:
     branches: [ main ]
@@ -17,29 +17,37 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-      - name: Verify model download endpoint
+      - name: Download bundled Qwen3 0.6B INT4 model
         run: |
-          curl -L --fail --silent --show-error --range 0-1023 \
-            "https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/main/gemma-4-E2B-it.litertlm?download=true" \
-            -o /tmp/gemma-model-check
-          test "$(stat -c%s /tmp/gemma-model-check)" -ge 1024
-          echo "Gemma 4 download endpoint is reachable."
+          mkdir -p app/src/main/assets
+          curl --fail --location --retry 5 --retry-all-errors --silent --show-error \
+            "https://huggingface.co/litert-community/Qwen3-0.6B-int4/resolve/main/qwen3_0.6b_nothink_q4_block32_ekv1280.litertlm" \
+            -o "app/src/main/assets/qwen3_0.6b_nothink_q4_block32_ekv1280.litertlm"
+          MODEL_BYTES="$(stat -c%s app/src/main/assets/qwen3_0.6b_nothink_q4_block32_ekv1280.litertlm)"
+          echo "Bundled model size: ${MODEL_BYTES} bytes"
+          test "${MODEL_BYTES}" -ge 300000000
+          test "${MODEL_BYTES}" -le 400000000
       - name: Compile APK
         run: gradle --no-daemon assembleDebug
-      - name: Verify APK
+      - name: Verify APK contains bundled model
         run: |
-          test -s app/build/outputs/apk/debug/app-debug.apk
-          ls -lh app/build/outputs/apk/debug/app-debug.apk
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$APK"
+          unzip -l "$APK" | grep -F "assets/qwen3_0.6b_nothink_q4_block32_ekv1280.litertlm"
+          APK_BYTES="$(stat -c%s "$APK")"
+          echo "APK size: ${APK_BYTES} bytes"
+          test "$APK_BYTES" -ge 300000000
+          ls -lh "$APK"
       - uses: actions/upload-artifact@v4
         with:
-          name: helen-ai-gemma4-debug-apk
+          name: helen-ai-qwen3-bundled-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 30
       - name: Publish APK
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: helen-gemma4-build-${{ github.run_number }}
-          name: Helen AI 4.0 Gemma 4 build ${{ github.run_number }}
+          tag_name: helen-qwen3-bundled-build-${{ github.run_number }}
+          name: HELEN AI 5.0 · Qwen3 bundled · build ${{ github.run_number }}
           prerelease: true
           files: app/build/outputs/apk/debug/app-debug.apk
