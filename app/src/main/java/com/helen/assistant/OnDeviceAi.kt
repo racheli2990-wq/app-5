@@ -9,8 +9,6 @@ import com.google.ai.edge.litertlm.Conversation
 import com.google.ai.edge.litertlm.ConversationConfig
 import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.EngineConfig
-import com.google.ai.edge.litertlm.ExperimentalApi
-import com.google.ai.edge.litertlm.ExperimentalFlags
 import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.MessageCallback
 import com.google.ai.edge.litertlm.SamplerConfig
@@ -22,7 +20,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.atomic.AtomicInteger
 
-/** Local Qwen3 runtime. The model is packaged inside the APK and copied to private storage on first launch. */
+/** Local Qwen2.5 1.5B runtime. Model weights ship inside the APK and are copied locally on first launch. */
 class OnDeviceAi(context: Context) : AutoCloseable {
     interface ModelListener {
         fun onProgress(percent: Int, status: String)
@@ -53,9 +51,9 @@ class OnDeviceAi(context: Context) : AutoCloseable {
     private val pendingChatRequests = AtomicInteger(0)
 
     companion object {
-        const val MODEL_NAME = "qwen3_0.6b_nothink_q4_block32_ekv1280.litertlm"
-        const val MODEL_BYTES_APPROX = 347_000_000L
-        private const val MIN_VALID_BYTES = 300_000_000L
+        const val MODEL_NAME = "Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv4096.litertlm"
+        const val MODEL_BYTES_APPROX = 1_600_000_000L
+        private const val MIN_VALID_BYTES = 1_500_000_000L
         private const val SYSTEM_PROMPT = """
 You are HELEN, a Hebrew-first personal assistant running locally on Android.
 Understand modern Hebrew, colloquial speech, typos, incomplete sentences, pronouns and prior conversation context.
@@ -122,7 +120,7 @@ RULES:
                     return@execute
                 }
                 if (!hasModel()) installBundledModel(listener)
-                postProgress(listener, 100, "מודל Qwen3 המובנה מוכן. מאתחלת מנוע AI…")
+                postProgress(listener, 100, "מודל Qwen2.5 המובנה מוכן. מאתחלת מנוע AI…")
                 if (!hasModel()) throw IllegalStateException("קובץ המודל לא תקין")
                 initializeModel()
                 ready = true
@@ -139,7 +137,7 @@ RULES:
         if (modelDir.usableSpace < MODEL_BYTES_APPROX + 100_000_000L) {
             throw IllegalStateException("אין מספיק מקום פנוי להעתקת מודל ה־AI המובנה. נדרשים כ־450MB פנויים.")
         }
-        postProgress(listener, 0, "מעתיקה את מודל Qwen3 המובנה מהאפליקציה…")
+        postProgress(listener, 0, "מעתיקה מודל AI מתקדם (1.5B) מתוך האפליקציה…")
         val installingFile = File(modelDir, "$MODEL_NAME.installing")
         try {
             app.assets.open(MODEL_NAME).buffered(1024 * 1024).use { input ->
@@ -171,7 +169,11 @@ RULES:
                 installingFile.copyTo(modelFile, overwrite = true)
                 installingFile.delete()
             }
-            postProgress(listener, 100, "מודל Qwen3 הותקן מתוך ה־APK.")
+            // Clean up the previous compact model after the new model is safely installed.
+            File(modelDir, "qwen3_0.6b_nothink_q4_block32_ekv1280.litertlm").delete()
+            File(app.cacheDir, "qwen3-cache").deleteRecursively()
+            File(app.cacheDir, "qwen3-cpu-cache").deleteRecursively()
+            postProgress(listener, 100, "מודל Qwen2.5 הותקן מתוך ה־APK.")
         } catch (t: Throwable) {
             installingFile.delete()
             throw t
@@ -179,7 +181,7 @@ RULES:
     }
 
     private fun initializeModel() {
-        val cache = File(app.cacheDir, "qwen3-cache").apply { mkdirs() }
+        val cache = File(app.cacheDir, "qwen25-cache").apply { mkdirs() }
         var selected: Engine? = null
         var gpuEngine: Engine? = null
         var gpuReady = false
@@ -200,7 +202,7 @@ RULES:
             val cpu = Engine(EngineConfig(
                 modelPath = modelFile.absolutePath,
                 backend = Backend.CPU(),
-                cacheDir = File(app.cacheDir, "qwen3-cpu-cache").apply { mkdirs() }.absolutePath
+                cacheDir = File(app.cacheDir, "qwen25-cpu-cache").apply { mkdirs() }.absolutePath
             ))
             cpu.initialize()
             selected = cpu
@@ -219,7 +221,7 @@ RULES:
                 systemInstruction = Contents.of(SYSTEM_PROMPT),
                 initialMessages = restoredMessages,
                 samplerConfig = sampler,
-                maxOutputToken = 176
+                maxOutputToken = 220
             ))
             val completionConversation = selected!!.createConversation(ConversationConfig(
                 systemInstruction = Contents.of(
@@ -227,7 +229,7 @@ RULES:
                     "אפשרות אחת בכל שורה, ללא מספור או הסברים. השלימי את הניסוח ואל תעני לפקודה עצמה."
                 ),
                 samplerConfig = SamplerConfig(topK = 20, topP = 0.85, temperature = 0.35),
-                maxOutputToken = 44
+                maxOutputToken = 56
             ))
             engine = selected
             chat = chatConversation
@@ -246,7 +248,7 @@ RULES:
                 val result = streamMessage(conversation, userText, 176) { callback.onProgress() }
                 main.post { callback.onSuccess(result) }
             } catch (t: Throwable) {
-                main.post { callback.onError(t.message ?: "שגיאה בהרצת מודל Qwen3") }
+                main.post { callback.onError(t.message ?: "שגיאה בהרצת מודל Qwen2.5") }
             } finally {
                 pendingChatRequests.decrementAndGet()
             }
