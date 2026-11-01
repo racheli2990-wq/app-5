@@ -279,7 +279,7 @@ RULES:
         val latch = CountDownLatch(1)
         conversation.sendMessageAsync(prompt, object : MessageCallback {
             override fun onMessage(message: Message) {
-                output.append(message.text)
+                output.append(message.toString())
                 onChunk?.invoke()
             }
             override fun onDone() { latch.countDown() }
