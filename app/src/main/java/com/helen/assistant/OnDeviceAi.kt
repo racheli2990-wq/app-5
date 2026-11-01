@@ -214,8 +214,8 @@ Important safety and accuracy rules:
         worker.execute {
             try {
                 val conversation = chat ?: throw IllegalStateException("מודל ה־AI עדיין לא מוכן")
-                val answer = conversation.sendMessage(userText).text
-                main.post { callback.onSuccess(answer ?: "") }
+                val answer = conversation.sendMessage(userText).toString()
+                main.post { callback.onSuccess(answer) }
             } catch (t: Throwable) {
                 main.post { callback.onError(t.message ?: "שגיאה בהרצת מודל ה־AI") }
             }
@@ -230,9 +230,8 @@ Important safety and accuracy rules:
         worker.execute {
             try {
                 val prompt = "השלימי את הפקודה או המשפט הבא ותני הצעות שימושיות:\n$partialText"
-                val raw = completion?.sendMessage(prompt)?.text.orEmpty()
+                val raw = completion?.sendMessage(prompt)?.toString().orEmpty()
                 val suggestions = raw
-                    .replace("", "")
                     .lineSequence()
                     .map { it.trim().removePrefix("-").trim().removePrefix("•").trim() }
                     .filter { it.isNotBlank() && it.length <= 100 && !it.startsWith("{") }
