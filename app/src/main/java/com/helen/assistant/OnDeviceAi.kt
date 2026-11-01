@@ -192,7 +192,7 @@ RULES:
             gpuEngine.initialize()
             selected = gpuEngine
             gpuReady = true
-            activeBackend = "GPU מואץ + MTP"
+            activeBackend = "GPU מואץ"
         } catch (_: Throwable) {
             try { gpuEngine?.close() } catch (_: Throwable) {}
         }
@@ -246,7 +246,7 @@ RULES:
                 val result = streamMessage(conversation, userText, 176) { callback.onProgress() }
                 main.post { callback.onSuccess(result) }
             } catch (t: Throwable) {
-                main.post { callback.onError(t.message ?: "שגיאה בהרצת Gemma 4") }
+                main.post { callback.onError(t.message ?: "שגיאה בהרצת מודל Qwen3") }
             } finally {
                 pendingChatRequests.decrementAndGet()
             }
