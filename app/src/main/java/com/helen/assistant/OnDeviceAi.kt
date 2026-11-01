@@ -344,7 +344,7 @@ RULES:
         return output.toString()
     }
 
-    fun deleteModel(callback: (Boolean) -> Unit) {
+    fun deleteModel(callback: java.util.function.Consumer<Boolean>) {
         worker.execute {
             ready = false
             try { completion?.close() } catch (_: Throwable) {}
@@ -356,7 +356,7 @@ RULES:
             val partialDeleted = !partialFile.exists() || partialFile.delete()
             val modelDeleted = !modelFile.exists() || modelFile.delete()
             activeBackend = "לא מותקן"
-            main.post { callback(partialDeleted && modelDeleted) }
+            main.post { callback.accept(partialDeleted && modelDeleted) }
         }
     }
 
