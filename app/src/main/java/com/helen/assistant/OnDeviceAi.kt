@@ -1,313 +1,126 @@
-package com.helen.assistant
+package com.helen.assistant;
 
-import android.content.Context
-import android.os.Handler
-import android.os.Looper
-import com.google.ai.edge.litertlm.Backend
-import com.google.ai.edge.litertlm.Contents
-import com.google.ai.edge.litertlm.Conversation
-import com.google.ai.edge.litertlm.ConversationConfig
-import com.google.ai.edge.litertlm.Engine
-import com.google.ai.edge.litertlm.EngineConfig
-import com.google.ai.edge.litertlm.ExperimentalApi
-import com.google.ai.edge.litertlm.ExperimentalFlags
-import com.google.ai.edge.litertlm.Message
-import com.google.ai.edge.litertlm.MessageCallback
-import com.google.ai.edge.litertlm.SamplerConfig
-import java.io.File
-import java.net.HttpURLConnection
-import java.net.URL
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicReference
+import android.accessibilityservice.AccessibilityService;import android.provider.AlarmClock;import android.Manifest;import android.app.*;import android.content.*;import android.content.pm.PackageManager;import android.hardware.camera2.CameraManager;import android.media.AudioManager;import android.net.Uri;import android.os.*;import android.provider.Settings;import android.speech.RecognizerIntent;import android.speech.tts.TextToSpeech;import android.view.*;import android.view.inputmethod.InputMethodManager;import android.widget.*;
+import androidx.appcompat.app.AppCompatActivity;import androidx.core.app.ActivityCompat;import androidx.core.content.ContextCompat;
+import java.util.*;import java.text.*;import android.icu.util.HebrewCalendar;import android.text.*;import org.json.*;
 
-/** Local Gemma 4 runtime. The large weight file is downloaded once and kept offline. */
-class OnDeviceAi(context: Context) : AutoCloseable {
-    interface ModelListener {
-        fun onProgress(percent: Int, status: String)
-        fun onReady()
-        fun onError(message: String)
-    }
-    interface AiCallback {
-        fun onProgress()
-        fun onSuccess(text: String)
-        fun onError(message: String)
-    }
-    interface SuggestionCallback {
-        fun onSuggestions(items: List<String>)
-    }
-
-    private val app = context.applicationContext
-    private val worker = Executors.newSingleThreadExecutor()
-    private val main = Handler(Looper.getMainLooper())
-    private val modelDir = File(app.filesDir, "models").apply { mkdirs() }
-    private val modelFile = File(modelDir, MODEL_NAME)
-    private val partialFile = File(modelDir, "$MODEL_NAME.part")
-    @Volatile private var ready = false
-    @Volatile private var activeBackend = "בהכנה"
-    private var engine: Engine? = null
-    private var chat: Conversation? = null
-    private var completion: Conversation? = null
-
-    companion object {
-        const val MODEL_NAME = "gemma-4-E2B-it.litertlm"
-        const val MODEL_BYTES_APPROX = 2_583_000_000L
-        const val MODEL_URL = "https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/main/gemma-4-E2B-it.litertlm?download=true"
-        private const val MIN_VALID_BYTES = 2_400_000_000L
-        private const val SYSTEM_PROMPT = """
-You are HELEN, a Hebrew-first personal assistant running locally on Android.
-Understand modern Hebrew, colloquial speech, typos, incomplete sentences, pronouns and prior conversation context.
-Reply naturally in Hebrew unless the user uses another language. Be clear, accurate and concise.
-
-For every response return ONLY one valid JSON object:
-{"reply":"short natural Hebrew response","actions":[{"tool":"tool_name","args":{"key":"value"}}]}
-For ordinary questions or conversation use "actions":[].
-A single sentence may request multiple actions. Use only tools listed below.
-Never claim an action succeeded until the app confirms it.
-
-TOOLS:
-- flashlight: {"enabled":true|false}
-- open_app: {"app":"application name"}
-- camera: {}
-- dial: {"number":"phone number"} (open dialer only; never place a call)
-- whatsapp: {"message":"optional text"} (open WhatsApp/share confirmation only; never send silently)
-- volume: {"direction":"up"|"down"} or {"percent":0..100}
-- brightness: {"percent":0..100}
-- ringer: {"mode":"normal"|"silent"}
-- wifi_settings, bluetooth_settings: {}
-- scroll: {"direction":"up"|"down"} (accessibility service required)
-- tap: {"x":number,"y":number} (only on explicit request; accessibility required)
-- type_text: {"text":"text"} (focused field and accessibility required)
-- back, home, screenshot, read_screen: {}
-- reminder: {"minutes":integer,"text":"reminder"}
-- timer: {"seconds":integer,"text":"label"}
-- alarm: {"hour":0..23,"minute":0..59,"text":"label"}
-- note_add, task_add, shopping_add: {"text":"content"}
-- expense_add: {"amount":number}
-- water_add: {"cups":integer}
-- calendar_add: {"title":"event","minutes":integer from now}
-- web_search, transit_search: {"query":"search phrase"} (only when explicitly requested)
-- knowledge_search: {"query":"phrase in imported local file"}
-- hebrew_date: {}
-
-RULES:
-- If an essential detail is missing, ask one short question and emit no action.
-- Never send a message, place a call, delete content, purchase anything or alter a security setting silently.
-- For Wi-Fi/Bluetooth, open Android settings; do not claim the radios were toggled.
-- Brightness and silent mode may require explicit Android permission.
-- Screen taps, typing, scrolling and screenshots require the user's explicit accessibility opt-in.
-- If a service is unavailable, explain which permission is needed.
-- Keep replies concise and don't invent details.
-"""
-    }
-
-    fun isReady(): Boolean = ready
-    fun backendName(): String = activeBackend
-    fun hasModel(): Boolean = modelFile.exists() && modelFile.length() >= MIN_VALID_BYTES
-    fun modelPath(): String = modelFile.absolutePath
-    fun partialBytes(): Long = if (partialFile.exists()) partialFile.length() else 0L
-
-    fun prepare(listener: ModelListener) {
-        worker.execute {
-            try {
-                if (!hasModel()) downloadModel(listener)
-                postProgress(listener, 100, "Gemma 4 הורד. מאתחלת מנוע AI…")
-                if (!hasModel()) throw IllegalStateException("קובץ המודל לא תקין")
-                initializeModel()
-                ready = true
-                main.post { listener.onReady() }
-            } catch (t: Throwable) {
-                ready = false
-                main.post { listener.onError(t.message ?: "טעינת מודל AI נכשלה") }
-            }
-        }
-    }
-
-    private fun downloadModel(listener: ModelListener) {
-        var existing = if (partialFile.exists()) partialFile.length() else 0L
-        if (existing > MODEL_BYTES_APPROX) {
-            partialFile.delete()
-            existing = 0L
-        }
-        val needed = (MODEL_BYTES_APPROX - existing).coerceAtLeast(0L) + 500_000_000L
-        if (modelDir.usableSpace < needed) {
-            throw IllegalStateException("אין מספיק מקום פנוי. נדרשים עוד כ־${formatMb(needed)}MB פנויים להשלמת ההורדה וההכנה.")
-        }
-        postProgress(listener, if (existing > 0) ((existing * 100) / MODEL_BYTES_APPROX).toInt() else 0,
-            if (existing > 0) "ממשיכה הורדת Gemma 4 מהמקום שבו נעצרה…" else "מורידה Gemma 4 · כ־2.58GB")
-        val connection = (URL(MODEL_URL).openConnection() as HttpURLConnection).apply {
-            connectTimeout = 30_000
-            readTimeout = 240_000
-            instanceFollowRedirects = true
-            setRequestProperty("User-Agent", "Helen-AI-3.0")
-            setRequestProperty("Accept-Encoding", "identity")
-            if (existing > 0) setRequestProperty("Range", "bytes=$existing-")
-        }
-        try {
-            connection.connect()
-            val code = connection.responseCode
-            if (code !in 200..299) throw IllegalStateException("שרת המודל החזיר HTTP $code")
-            val append = existing > 0 && code == HttpURLConnection.HTTP_PARTIAL
-            if (existing > 0 && !append) {
-                partialFile.delete()
-                existing = 0L
-            }
-            val total = if (connection.contentLengthLong > 0) existing + connection.contentLengthLong else MODEL_BYTES_APPROX
-            var received = existing
-            val output = if (append) {
-                java.io.FileOutputStream(partialFile, true).buffered(1024 * 1024)
-            } else {
-                partialFile.outputStream().buffered(1024 * 1024)
-            }
-            connection.inputStream.use { input ->
-                output.use { out ->
-                    val buffer = ByteArray(1024 * 1024)
-                    var read: Int
-                    var lastPercent = -1
-                    while (input.read(buffer).also { read = it } != -1) {
-                        out.write(buffer, 0, read)
-                        received += read
-                        val percent = ((received * 100L) / total).toInt().coerceIn(0, 99)
-                        if (percent != lastPercent) {
-                            lastPercent = percent
-                            postProgress(listener, percent, "מורידה מודל AI · ${formatMb(received)}MB / כ־2,583MB")
-                        }
-                    }
-                    out.flush()
-                }
-            }
-            if (partialFile.length() < MIN_VALID_BYTES) {
-                throw IllegalStateException("ההורדה הסתיימה מוקדם מדי. אפשר לנסות שוב וההורדה תמשיך.")
-            }
-            if (modelFile.exists()) modelFile.delete()
-            if (!partialFile.renameTo(modelFile)) {
-                partialFile.copyTo(modelFile, overwrite = true)
-                partialFile.delete()
-            }
-        } finally {
-            connection.disconnect()
-        }
-    }
-
-    @OptIn(ExperimentalApi::class)
-    private fun initializeModel() {
-        ExperimentalFlags.enableSpeculativeDecoding = true
-        val cache = File(app.cacheDir, "gemma4-cache").apply { mkdirs() }
-        var selected: Engine? = null
-        var gpuReady = false
-        try {
-            val gpu = Engine(EngineConfig(
-                modelPath = modelFile.absolutePath,
-                backend = Backend.GPU(),
-                cacheDir = cache.absolutePath
-            ))
-            gpu.initialize()
-            selected = gpu
-            gpuReady = true
-            activeBackend = "GPU מואץ + MTP"
-        } catch (_: Throwable) {
-            // Some phones do not expose a compatible OpenCL driver. Retry with CPU.
-        }
-        if (!gpuReady) {
-            val cpu = Engine(EngineConfig(
-                modelPath = modelFile.absolutePath,
-                backend = Backend.CPU(),
-                cacheDir = File(app.cacheDir, "gemma4-cpu-cache").apply { mkdirs() }.absolutePath
-            ))
-            cpu.initialize()
-            selected = cpu
-            activeBackend = "CPU + MTP"
-        }
-        val sampler = SamplerConfig(topK = 24, topP = 0.88, temperature = 0.2)
-        try {
-            val chatConversation = selected!!.createConversation(ConversationConfig(
-                systemInstruction = Contents.of(SYSTEM_PROMPT),
-                samplerConfig = sampler
-            ))
-            val completionConversation = selected!!.createConversation(ConversationConfig(
-                systemInstruction = Contents.of(
-                    "את מנוע השלמת המשפטים של הלן. החזירי 3 המשכים טבעיים וקצרים בעברית, " +
-                    "אפשרות אחת בכל שורה, ללא מספור או הסברים. השלימי את הניסוח ואל תעני לפקודה עצמה."
-                ),
-                samplerConfig = SamplerConfig(topK = 20, topP = 0.85, temperature = 0.35)
-            ))
-            engine = selected
-            chat = chatConversation
-            completion = completionConversation
-        } catch (t: Throwable) {
-            try { selected?.close() } catch (_: Throwable) {}
-            throw t
-        }
-    }
-
-    fun ask(userText: String, callback: AiCallback) {
-        worker.execute {
-            try {
-                val conversation = chat ?: throw IllegalStateException("מודל ה־AI עדיין לא מוכן")
-                val result = streamMessage(conversation, userText) { callback.onProgress() }
-                main.post { callback.onSuccess(result) }
-            } catch (t: Throwable) {
-                main.post { callback.onError(t.message ?: "שגיאה בהרצת Gemma 4") }
-            }
-        }
-    }
-
-    fun suggest(partialText: String, callback: SuggestionCallback) {
-        if (!ready || partialText.trim().length < 3) {
-            main.post { callback.onSuggestions(emptyList()) }
-            return
-        }
-        worker.execute {
-            try {
-                val prompt = "השלימי את המשפט או הפקודה הבאים:\n$partialText"
-                val raw = streamMessage(completion ?: throw IllegalStateException("מנוע ההשלמה אינו זמין"), prompt)
-                val items = raw.replace("\r", "").lineSequence()
-                    .map { it.trim().removePrefix("-").removePrefix("•").trim() }
-                    .filter { it.isNotBlank() && it.length <= 90 && !it.startsWith("{") }
-                    .distinct().take(3).toList()
-                main.post { callback.onSuggestions(items) }
-            } catch (_: Throwable) {
-                main.post { callback.onSuggestions(emptyList()) }
-            }
-        }
-    }
-
-    private fun streamMessage(conversation: Conversation, prompt: String, onChunk: (() -> Unit)? = null): String {
-        val output = StringBuilder()
-        val error = AtomicReference<Throwable?>(null)
-        val latch = CountDownLatch(1)
-        conversation.sendMessageAsync(prompt, object : MessageCallback {
-            override fun onMessage(message: Message) {
-                output.append(message.toString())
-                onChunk?.invoke()
-            }
-            override fun onDone() { latch.countDown() }
-            override fun onError(throwable: Throwable) {
-                error.set(throwable)
-                latch.countDown()
-            }
-        })
-        if (!latch.await(5, TimeUnit.MINUTES)) throw IllegalStateException("המודל לא סיים בזמן. נסי שוב.")
-        error.get()?.let { throw it }
-        return output.toString()
-    }
-
-    private fun formatMb(bytes: Long): String = String.format("%.0f", bytes / (1024.0 * 1024.0))
-    private fun postProgress(listener: ModelListener, percent: Int, status: String) {
-        main.post { listener.onProgress(percent, status) }
-    }
-
-    override fun close() {
-        ready = false
-        worker.execute {
-            try { completion?.close() } catch (_: Throwable) {}
-            try { chat?.close() } catch (_: Throwable) {}
-            try { engine?.close() } catch (_: Throwable) {}
-            completion = null
-            chat = null
-            engine = null
-        }
-        worker.shutdown()
-    }
+public class MainActivity extends AppCompatActivity{
+ int bg=0xff0B100D,panel=0xff151E18,green=0xffC7F36B,muted=0xff91A096,white=0xffF3F7F1,card=0xff1C2921;
+ LinearLayout root,body,chat,suggestionRow;EditText input;TextToSpeech tts;TextView aiStatus;OnDeviceAi ai;Handler aiHandler=new Handler(Looper.getMainLooper());Runnable suggestionTask;String tab="chat";boolean torch=false;String pendingReminder="";boolean exportPending=false;boolean aiReady=false;boolean aiBusy=false;float textScale=1f;ArrayList<String> chatHistory=new ArrayList<>();
+ android.content.SharedPreferences prefs;ArrayList<String> notes=new ArrayList<>(),tasks=new ArrayList<>(),shopping=new ArrayList<>(),routines=new ArrayList<>();String knowledge="";
+ @Override public void onCreate(Bundle b){super.onCreate(b);getWindow().setStatusBarColor(bg);getWindow().setNavigationBarColor(bg);prefs=getSharedPreferences("helen",0);notes.addAll(prefs.getStringSet("notes",new HashSet<>()));tasks.addAll(prefs.getStringSet("tasks",new HashSet<>()));shopping.addAll(prefs.getStringSet("shopping",new HashSet<>()));knowledge=prefs.getString("knowledge","");textScale=prefs.getFloat("text_scale",1f);loadChatHistory();routines.addAll(prefs.getStringSet("routines",new HashSet<>()));applyThemePalette(prefs.getBoolean("light_mode",false));tts=new TextToSpeech(this,s->{});showShell();askPermissions();initAi();}
+ void askPermissions(){ArrayList<String> p=new ArrayList<>();if(ContextCompat.checkSelfPermission(this,Manifest.permission.CAMERA)!=0)p.add(Manifest.permission.CAMERA);if(Build.VERSION.SDK_INT>=33&&ContextCompat.checkSelfPermission(this,Manifest.permission.POST_NOTIFICATIONS)!=0)p.add(Manifest.permission.POST_NOTIFICATIONS);if(!p.isEmpty())ActivityCompat.requestPermissions(this,p.toArray(new String[0]),7);}
+ int dp(float v){return (int)(v*getResources().getDisplayMetrics().density+.5f);}
+ TextView text(String s,int size,int color,boolean bold){TextView t=new TextView(this);t.setText(s);t.setTextSize(size*textScale);t.setTextColor(color);if(bold)t.setTypeface(null,1);return t;}
+ android.graphics.drawable.GradientDrawable shape(int c,int r){android.graphics.drawable.GradientDrawable d=new android.graphics.drawable.GradientDrawable();d.setColor(c);d.setCornerRadius(dp(r));return d;}
+ void showShell(){
+  root=new LinearLayout(this);root.setOrientation(1);root.setBackgroundColor(bg);setContentView(root);
+  LinearLayout top=new LinearLayout(this);top.setGravity(Gravity.CENTER_VERTICAL);top.setPadding(dp(20),dp(14),dp(20),dp(12));
+  LinearLayout brand=new LinearLayout(this);brand.setOrientation(1);
+  TextView logo=text("HELEN",20,white,true);logo.setLetterSpacing(.12f);brand.addView(logo);
+  TextView sub=text("העוזרת האישית שלך",11,muted,false);brand.addView(sub);top.addView(brand);
+  View spacer=new View(this);top.addView(spacer,new LinearLayout.LayoutParams(0,1,1));
+  LinearLayout status=new LinearLayout(this);status.setGravity(Gravity.CENTER);status.setPadding(dp(10),dp(7),dp(10),dp(7));status.setBackground(shape(card,24));
+  TextView dot=text("●",9,green,true);status.addView(dot);aiStatus=text(aiReady?"  AI מוכן":"  טוען מודל…",10,white,true);status.addView(aiStatus);top.addView(status);
+  TextView mic=text("⌁",25,green,true);mic.setGravity(Gravity.CENTER);mic.setPadding(dp(12),0,0,0);mic.setOnClickListener(v->voice());top.addView(mic);root.addView(top);
+  View line=new View(this);line.setBackgroundColor(0xff26342B);root.addView(line,new LinearLayout.LayoutParams(-1,dp(1)));
+  ScrollView sc=new ScrollView(this);sc.setFillViewport(true);body=new LinearLayout(this);body.setOrientation(1);body.setPadding(dp(18),dp(18),dp(18),dp(20));sc.addView(body);root.addView(sc,new LinearLayout.LayoutParams(-1,0,1));
+  LinearLayout bottom=new LinearLayout(this);bottom.setOrientation(1);bottom.setPadding(dp(14),dp(10),dp(14),dp(8));bottom.setBackgroundColor(panel);
+  suggestionRow=new LinearLayout(this);suggestionRow.setOrientation(LinearLayout.HORIZONTAL);suggestionRow.setGravity(Gravity.CENTER_VERTICAL);suggestionRow.setVisibility(View.GONE);bottom.addView(suggestionRow);
+  LinearLayout row=new LinearLayout(this);row.setGravity(Gravity.CENTER_VERTICAL);input=new EditText(this);input.setSingleLine(true);input.setTextColor(white);input.setHintTextColor(muted);input.setHint("שאלי את הלן משהו…");input.setTextSize(15*textScale);input.setPadding(dp(17),dp(12),dp(17),dp(12));input.setBackground(shape(0xff253329,28));row.addView(input,new LinearLayout.LayoutParams(0,dp(52),1));
+  input.addTextChangedListener(new TextWatcher(){public void beforeTextChanged(CharSequence c,int st,int count,int after){}public void onTextChanged(CharSequence c,int st,int before,int count){if(suggestionTask!=null)aiHandler.removeCallbacks(suggestionTask);String q=c.toString().trim();if(q.length()<3||!aiReady||aiBusy){suggestionRow.setVisibility(View.GONE);return;}suggestionTask=()->ai.suggest(q,items->showSuggestions(items));aiHandler.postDelayed(suggestionTask,800);}public void afterTextChanged(Editable e){}});
+  TextView send=text("↑",24,bg,true);send.setGravity(Gravity.CENTER);send.setBackground(shape(green,28));LinearLayout.LayoutParams sendP=new LinearLayout.LayoutParams(dp(52),dp(52));sendP.setMargins(dp(8),0,0,0);row.addView(send,sendP);send.setOnClickListener(v->{String value=input.getText().toString().trim();if(suggestionTask!=null)aiHandler.removeCallbacks(suggestionTask);suggestionRow.setVisibility(View.GONE);input.setText("");handle(value);});bottom.addView(row);
+  LinearLayout nav=new LinearLayout(this);nav.setGravity(Gravity.CENTER);String[][] tabs={{"chat","צ׳אט","✧"},{"mine","המרחב שלי","▦"},{"knowledge","ידע","◈"},{"settings","הגדרות","⚙"}};for(String[] a:tabs){LinearLayout cell=new LinearLayout(this);cell.setOrientation(1);cell.setGravity(Gravity.CENTER);cell.setPadding(0,dp(7),0,dp(3));TextView ic=text(a[2],19,tab.equals(a[0])?green:muted,true);TextView tx=text(a[1],10,tab.equals(a[0])?green:muted,false);cell.addView(ic);cell.addView(tx);cell.setOnClickListener(v->{tab=a[0];renderTab();});nav.addView(cell,new LinearLayout.LayoutParams(0,-2,1));}bottom.addView(nav);root.addView(bottom);renderTab();
+ }
+ void renderTab(){body.removeAllViews();if(tab.equals("chat")){
+  LinearLayout hero=new LinearLayout(this);hero.setOrientation(1);hero.setPadding(dp(20),dp(20),dp(20),dp(20));hero.setBackground(shape(0xff203127,24));
+  TextView kicker=text("HELEN  /  GEMMA 4  /  LOCAL AI",11,green,true);kicker.setLetterSpacing(.1f);hero.addView(kicker);
+  TextView h=text("יותר חכמה.\nיותר קרובה.",29,white,true);h.setPadding(0,dp(10),0,dp(5));hero.addView(h);
+  TextView desc=text("Gemma 4 E2B · האצת GPU + MTP · שיחה והשלמת ניסוחים במכשיר",12,0xffC4D1C7,false);hero.addView(desc);
+  TextView state=text(aiReady?"●  המודל מוכן לשיחה":"◌  "+(aiStatus==null?"טוען…":aiStatus.getText()),11,green,true);state.setPadding(0,dp(16),0,0);hero.addView(state);body.addView(hero);
+  TextView section=text("מה אפשר לעשות?",17,white,true);section.setPadding(0,dp(22),0,dp(10));body.addView(section);
+  GridLayout grid=new GridLayout(this);grid.setColumnCount(2);String[][] actions={{"☼","שליטה בטלפון","פנס · ווליום · בהירות","הדליקי פנס והגבירי ווליום"},{"◷","סדר יום","תזכורות · טיימר · שעון","תזכירי לי בעוד 10 דקות"},{"▤","פתקים ומשימות","לכתוב · לזכור · לארגן","הוסיפי משימה לקניות"},{"⌕","חיפוש ותחבורה","אפליקציות · מסלולים","חפשי מסלול לירושלים"}};for(String[] a:actions){LinearLayout tile=new LinearLayout(this);tile.setOrientation(1);tile.setPadding(dp(15),dp(14),dp(12),dp(15));tile.setBackground(shape(card,18));TextView ic=text(a[0],23,green,true);tile.addView(ic);TextView name=text(a[1],14,white,true);name.setPadding(0,dp(9),0,dp(3));tile.addView(name);tile.addView(text(a[2],10,muted,false));tile.setOnClickListener(v->handle(a[3]));GridLayout.LayoutParams gp=new GridLayout.LayoutParams();gp.width=0;gp.height=-2;gp.columnSpec=GridLayout.spec(GridLayout.UNDEFINED,1f);gp.setMargins(0,0,dp(8),dp(8));grid.addView(tile,gp);}body.addView(grid);
+  TextView recent=text("שיחות אחרונות",17,white,true);recent.setPadding(0,dp(14),0,dp(8));body.addView(recent);if(chatHistory.isEmpty())body.addView(text("השיחות שלך יופיעו כאן.",12,muted,false));else{int count=0;for(int i=chatHistory.size()-1;i>=0&&count<5;i--,count++)body.addView(text("•  "+chatHistory.get(i),12,muted,false));}
+ }else if(tab.equals("mine")){
+  title("המרחב שלי","כל הדברים החשובים שלך במקום אחד.");
+  infoCard("היום שלך","💧  "+prefs.getInt("water",0)+" כוסות מים     ·     ₪ "+prefs.getFloat("expenses",0)+" הוצאות");
+  sectionList("פתקים",notes);sectionList("משימות",tasks);sectionList("רשימת קניות",shopping);sectionList("שגרות אישיות",routines);for(String routine:routines)button("▶  "+routine,()->handle(routine));button("＋  שגרה חדשה",()->addRoutine());
+  button("＋  פתק חדש",()->addEntry("notes"));button("＋  משימה חדשה",()->addEntry("tasks"));button("＋  פריט לרשימת קניות",()->addEntry("shopping"));
+  button("💧  הוספת כוס מים",()->{int n=prefs.getInt("water",0)+1;prefs.edit().putInt("water",n).apply();renderTab();});
+  button("₪  הוספת הוצאה",()->expense());
+ }else if(tab.equals("knowledge")){
+  title("הספרייה שלך","מאגר ידע מקומי, זמין גם בלי אינטרנט.");
+  infoCard("מאגר הידע",knowledge.isEmpty()?"עדיין לא יובא קובץ":"מוכן · "+knowledge.length()+" תווים");
+  button("＋  ייבוא קובץ טקסט",()->importKnowledge());
+  button("⌕  חיפוש במאגר",()->{EditText e=new EditText(this);e.setHint("מה לחפש?");new AlertDialog.Builder(this).setTitle("חיפוש ידע מקומי").setView(e).setPositiveButton("חיפוש",(d,w)->searchKnowledge(e.getText().toString())).setNegativeButton("ביטול",null).show();});
+ }else settings();}
+ void loadChatHistory(){String json=prefs.getString("chat_history_json","");if(!json.isEmpty()){try{JSONArray a=new JSONArray(json);for(int i=0;i<a.length();i++)chatHistory.add(a.optString(i));}catch(Exception ignored){}}if(chatHistory.isEmpty())chatHistory.addAll(prefs.getStringSet("chat_history",new LinkedHashSet<>()));}
+ void clearChatHistory(){new AlertDialog.Builder(this).setTitle("ניקוי היסטוריית שיחות").setMessage("למחוק את השיחות השמורות במכשיר?").setNegativeButton("ביטול",null).setPositiveButton("מחיקה",(d,w)->{chatHistory.clear();prefs.edit().remove("chat_history_json").remove("chat_history").apply();if(aiReady){aiReady=false;aiBusy=false;ai.close();ai=new OnDeviceAi(this);ai.setConversationHistory(chatHistory);retryAi();}renderTab();Toast.makeText(this,"היסטוריית השיחות נמחקה",Toast.LENGTH_SHORT).show();}).show();}
+ void confirmDeleteModel(){new AlertDialog.Builder(this).setTitle("מחיקת מודל Gemma 4").setMessage("המודל תופס כ־2.58GB. מחיקתו תפנה מקום; כדי להשתמש שוב ב־AI יהיה צורך להוריד אותו מחדש.").setNegativeButton("ביטול",null).setPositiveButton("מחקי מודל",(d,w)->{if(aiStatus!=null)aiStatus.setText("מוחקת מודל…");ai.deleteModel(ok->{aiReady=false;aiBusy=false;if(aiStatus!=null)aiStatus.setText("מודל לא מותקן");renderTab();Toast.makeText(this,ok?"המודל נמחק ופונה מקום":"לא ניתן למחוק את כל קובצי המודל",Toast.LENGTH_LONG).show();});}).show();}
+ void infoCard(String title,String value){LinearLayout c=new LinearLayout(this);c.setOrientation(1);c.setPadding(dp(16),dp(15),dp(16),dp(15));c.setBackground(shape(card,18));c.addView(text(title,13,green,true));TextView v=text(value,14,white,true);v.setPadding(0,dp(6),0,0);c.addView(v);body.addView(c);}
+ void title(String a,String b){TextView t=text(a,27,white,true);t.setPadding(0,dp(2),0,dp(4));body.addView(t);TextView sub=text(b,13,muted,false);sub.setPadding(0,0,0,dp(18));body.addView(sub);}
+ void bubble(String value){if(body==null)return;boolean user=value.startsWith("את:");String clean=value.replaceFirst("^(את:|הלן:)\\s*","");LinearLayout wrap=new LinearLayout(this);wrap.setOrientation(1);wrap.setGravity(user?Gravity.END:Gravity.START);TextView t=text(clean,14,user?bg:white,false);t.setPadding(dp(15),dp(12),dp(15),dp(12));t.setMaxWidth((int)(getResources().getDisplayMetrics().widthPixels*.84));t.setBackground(shape(user?green:card,19));wrap.addView(t);LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(-1,-2);p.setMargins(0,dp(5),0,dp(7));body.addView(wrap,p);if(user||value.startsWith("הלן:")){chatHistory.add(value);while(chatHistory.size()>30)chatHistory.remove(0);JSONArray saved=new JSONArray();for(String line:chatHistory)saved.put(line);prefs.edit().putString("chat_history_json",saved.toString()).apply();}}
+ void quick(String... ss){for(String value:ss)button(value,()->handle(value));}
+ void button(String value,Runnable action){LinearLayout tile=new LinearLayout(this);tile.setGravity(Gravity.CENTER_VERTICAL);tile.setPadding(dp(15),dp(13),dp(15),dp(13));tile.setBackground(shape(card,15));TextView label=text(value,14,white,true);tile.addView(label,new LinearLayout.LayoutParams(0,-2,1));TextView arrow=text("‹",22,green,true);tile.addView(arrow);tile.setOnClickListener(v->action.run());LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(-1,-2);p.setMargins(0,dp(4),0,dp(4));body.addView(tile,p);}
+ void sectionList(String title,ArrayList<String> list){TextView head=text(title,16,green,true);head.setPadding(0,dp(17),0,dp(7));body.addView(head);if(list.isEmpty())body.addView(text("עדיין אין פריטים כאן",12,muted,false));else for(String value:list){TextView item=text("•  "+value,14,white,false);item.setPadding(dp(10),dp(7),dp(10),dp(7));body.addView(item);}}
+ void settings(){title("הגדרות","התאימי את הלן לסגנון העבודה שלך.");long modelBytes=ai==null?0:ai.modelSizeBytes();String modelState=aiReady?ai.backendName():(ai!=null&&ai.hasModel()?"המודל שמור · טעינה נדרשת":"טרם הורד");infoCard("מודל בינה מלאכותית","Gemma 4 E2B · כ־2.58GB · "+modelState+"\nקובץ מקומי: "+(modelBytes>0?(modelBytes/(1024*1024))+"MB":"לא קיים")+"\nהורדה חד־פעמית; לאחריה ניתן לעבוד ללא רשת.");if(!aiReady)button("↻  נסי שוב להוריד או להפעיל את המודל",()->retryAi());if(ai!=null&&ai.hasModel())button("פינוי מקום · מחיקת קובץ מודל Gemma 4",()->confirmDeleteModel());button("ניקוי היסטוריית שיחות",()->clearChatHistory());button("מצב תצוגה: "+(prefs.getBoolean("light_mode",false)?"בהיר":"כהה"),()->toggleTheme());body.addView(text("גודל טקסט",13,muted,true));SeekBar size=new SeekBar(this);size.setMax(50);size.setProgress(Math.max(0,Math.min(50,Math.round((textScale-.8f)*100))));body.addView(size);size.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener(){public void onProgressChanged(SeekBar b,int p,boolean u){if(u){textScale=.8f+p/100f;prefs.edit().putFloat("text_scale",textScale).apply();}}public void onStartTrackingTouch(SeekBar b){}public void onStopTrackingTouch(SeekBar b){renderTab();}});body.addView(text("מהירות הקראה",13,muted,true));SeekBar speed=new SeekBar(this);speed.setMax(15);speed.setProgress(Math.max(0,Math.min(15,Math.round((prefs.getFloat("speech_rate",1f)-.6f)*10))));body.addView(speed);speed.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener(){public void onProgressChanged(SeekBar b,int p,boolean u){if(u){float rate=.6f+p/10f;prefs.edit().putFloat("speech_rate",rate).apply();if(tts!=null)tts.setSpeechRate(rate);}}public void onStartTrackingTouch(SeekBar b){}public void onStopTrackingTouch(SeekBar b){}});button("שירות נגישות · לחיצה, הקלדה וגלילה",()->startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)));button("הרשאות אפליקציה",()->startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,Uri.parse("package:"+getPackageName()))));button("הגדרות בהירות מסך",()->startActivity(new Intent(Settings.ACTION_DISPLAY_SETTINGS)));button("הגדרות Wi-Fi ו-Bluetooth",()->{if(Build.VERSION.SDK_INT>=29)startActivity(new Intent(Settings.Panel.ACTION_INTERNET_CONNECTIVITY));else startActivity(new Intent(Settings.ACTION_WIFI_SETTINGS));});button("גיבוי נתונים לקובץ",()->exportBackup());button("שחזור מגיבוי",()->importBackup());}
+ void applyThemePalette(boolean light){if(light){bg=0xffF2F5F1;panel=0xffE4EBE4;card=0xffFFFFFF;green=0xff426B27;muted=0xff647168;white=0xff18231B;}else{bg=0xff0B100D;panel=0xff151E18;card=0xff1C2921;green=0xffC7F36B;muted=0xff91A096;white=0xffF3F7F1;}getWindow().setStatusBarColor(bg);getWindow().setNavigationBarColor(bg);}
+ void toggleTheme(){boolean light=!prefs.getBoolean("light_mode",false);prefs.edit().putBoolean("light_mode",light).apply();applyThemePalette(light);showShell();if(aiReady&&aiStatus!=null)aiStatus.setText("AI מוכן");}
+ void addRoutine(){EditText e=new EditText(this);e.setHint("למשל: תדליקי פנס ותגבירי ווליום");new AlertDialog.Builder(this).setTitle("יצירת שגרה").setView(e).setPositiveButton("שמירה",(d,w)->{String v=e.getText().toString().trim();if(!v.isEmpty()){routines.add(v);prefs.edit().putStringSet("routines",new HashSet<>(routines)).apply();renderTab();}}).setNegativeButton("ביטול",null).show();}
+ void initAi(){ai=new OnDeviceAi(this);ai.setConversationHistory(chatHistory);aiStatus.setText("Gemma 4 · הורדה חד־פעמית");ai.prepare(new OnDeviceAi.ModelListener(){public void onProgress(int p,String status){runOnUiThread(()->{if(aiStatus!=null)aiStatus.setText(status);});}public void onReady(){runOnUiThread(()->{aiReady=true;if(aiStatus!=null){aiStatus.setText("AI מוכן");aiStatus.setTextColor(green);}if("chat".equals(tab))bubble("Gemma 4 מוכנה. אפשר לדבר איתי בעברית, לבקש עזרה או להפעיל פקודות.");});}public void onError(String e){runOnUiThread(()->{aiReady=false;if(aiStatus!=null){aiStatus.setText("AI מושהה");aiStatus.setTextColor(0xffff8a80);}if("chat".equals(tab))bubble("המודל עדיין לא מוכן: "+e+" אפשר לנסות שוב בהגדרות.");});}});}
+ void retryAi(){if(ai!=null)ai.prepare(new OnDeviceAi.ModelListener(){public void onProgress(int p,String status){runOnUiThread(()->{if(aiStatus!=null)aiStatus.setText(p>=0?("AI "+p+"%"):status);});}public void onReady(){runOnUiThread(()->{aiReady=true;if(aiStatus!=null)aiStatus.setText("AI מוכן");renderTab();});}public void onError(String e){runOnUiThread(()->{aiReady=false;reply("המודל עדיין לא מוכן: "+e);});}});}
+ void showSuggestions(java.util.List<String> items){if(suggestionRow==null)return;suggestionRow.removeAllViews();if(items==null||items.isEmpty()){suggestionRow.setVisibility(View.GONE);return;}for(String item:items){TextView chip=text(item,12,white,true);chip.setPadding(dp(12),dp(8),dp(12),dp(8));chip.setBackground(shape(0xff334238,18));LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(-2,-2);p.setMargins(0,0,dp(6),dp(4));suggestionRow.addView(chip,p);chip.setOnClickListener(v->{input.setText(item);input.setSelection(input.length());});}suggestionRow.setVisibility(View.VISIBLE);}
+ void handle(String raw){if(raw==null||raw.trim().isEmpty())return;if(!"chat".equals(tab)){tab="chat";renderTab();}bubble("את: "+raw);if(!aiReady){reply("מודל ה־AI עדיין נטען. נסי שוב בעוד רגע.");return;}aiBusy=true;if(aiStatus!=null)aiStatus.setText("מנסחת…");ai.ask(raw,new OnDeviceAi.AiCallback(){public void onProgress(){runOnUiThread(()->{if(aiStatus!=null)aiStatus.setText("מנסחת…");});}public void onSuccess(String output){runOnUiThread(()->{aiBusy=false;if(aiStatus!=null)aiStatus.setText("AI מוכן");parseAiOutput(output);});}public void onError(String error){runOnUiThread(()->{aiBusy=false;if(aiStatus!=null)aiStatus.setText("AI מוכן");reply("שגיאה במודל המקומי: "+error);});}});}
+ void parseAiOutput(String output){try{String cleaned=output.trim().replace("```json","").replace("```","").trim();int first=cleaned.indexOf('{'),last=cleaned.lastIndexOf('}');if(first<0||last<=first){reply(cleaned);return;}JSONObject root=new JSONObject(cleaned.substring(first,last+1));String answer=root.optString("reply","");if(!answer.isEmpty())reply(answer);JSONArray actions=root.optJSONArray("actions");if(actions!=null)for(int i=0;i<actions.length();i++){JSONObject action=actions.optJSONObject(i);if(action!=null)runAiAction(action);}}catch(Exception e){reply(output.trim());}}
+ String arg(JSONObject o,String key,String fallback){return o.has(key)?o.optString(key,fallback):fallback;}
+ void runAiAction(JSONObject action){try{String tool=action.optString("tool","");JSONObject a=action.optJSONObject("arguments");if(a==null)a=action.optJSONObject("args");if(a==null)a=action;switch(tool){
+ case "flashlight":{boolean enabled=a.optBoolean("enabled",!torch);if(torch!=enabled)toggleTorch();break;}
+ case "open_app":openNamedApp(arg(a,"app",""));break;
+ case "camera":startActivity(new Intent("android.media.action.IMAGE_CAPTURE"));break;
+ case "dial":startActivity(new Intent(Intent.ACTION_DIAL,Uri.parse("tel:"+Uri.encode(arg(a,"number","")))));break;
+ case "whatsapp":{String message=arg(a,"message","");if(message.isEmpty())launchPackage("com.whatsapp");else{Intent send=new Intent(Intent.ACTION_SEND).setType("text/plain").setPackage("com.whatsapp").putExtra(Intent.EXTRA_TEXT,message);try{startActivity(send);}catch(Exception ex){launchPackage("com.whatsapp");}}break;}
+ case "volume":{AudioManager am=(AudioManager)getSystemService(AUDIO_SERVICE);if(a.has("percent")){int max=am.getStreamMaxVolume(AudioManager.STREAM_MUSIC);int val=Math.max(0,Math.min(max,(int)(a.optDouble("percent",50)*max/100)));am.setStreamVolume(AudioManager.STREAM_MUSIC,val,AudioManager.FLAG_SHOW_UI);}else am.adjustVolume("down".equals(a.optString("direction"))?AudioManager.ADJUST_LOWER:AudioManager.ADJUST_RAISE,AudioManager.FLAG_SHOW_UI);break;}
+ case "brightness":setBrightness(a.optInt("percent",50));break;
+ case "ringer":setRinger(a.optString("mode","normal"));break;
+ case "wifi_settings":startActivity(new Intent(Build.VERSION.SDK_INT>=29?Settings.Panel.ACTION_INTERNET_CONNECTIVITY:Settings.ACTION_WIFI_SETTINGS));break;
+ case "bluetooth_settings":startActivity(new Intent(Settings.ACTION_BLUETOOTH_SETTINGS));break;
+ case "scroll":{HelenAccessibilityService svc=HelenAccessibilityService.get();if(svc!=null)svc.scroll(!"up".equals(a.optString("direction")));else reply("כדי לגלול, הפעילי את שירות הנגישות של הלן בהגדרות.");break;}
+ case "tap":{HelenAccessibilityService svc=HelenAccessibilityService.get();if(svc!=null)svc.tap((float)a.optDouble("x",0),(float)a.optDouble("y",0));else reply("הפעילי שירות נגישות לפני לחיצה על המסך.");break;}
+ case "type_text":{HelenAccessibilityService svc=HelenAccessibilityService.get();if(svc!=null)svc.typeText(arg(a,"text",""));else reply("הפעילי שירות נגישות לפני הקלדה.");break;}
+ case "back":{HelenAccessibilityService svc=HelenAccessibilityService.get();if(svc!=null)svc.back();else onBackPressed();break;}
+ case "home":{HelenAccessibilityService svc=HelenAccessibilityService.get();if(svc!=null)svc.home();else startActivity(new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME));break;}
+ case "screenshot":{HelenAccessibilityService svc=HelenAccessibilityService.get();if(svc!=null&&Build.VERSION.SDK_INT>=30)svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_TAKE_SCREENSHOT);else reply("צילום מסך דורש הפעלת שירות הנגישות.");break;}
+ case "reminder":{int m=Math.max(1,a.optInt("minutes",10));scheduleReminder("תזכורת: "+arg(a,"text","תזכורת מהלן")+" בעוד "+m+" דקות");break;}
+ case "timer":{int sec=Math.max(1,a.optInt("seconds",60));startActivity(new Intent(AlarmClock.ACTION_SET_TIMER).putExtra(AlarmClock.EXTRA_LENGTH,sec).putExtra(AlarmClock.EXTRA_MESSAGE,arg(a,"text","טיימר מהלן")));break;}
+ case "alarm":{Intent alarm=new Intent(AlarmClock.ACTION_SET_ALARM).putExtra(AlarmClock.EXTRA_HOUR,a.optInt("hour",8)).putExtra(AlarmClock.EXTRA_MINUTES,a.optInt("minute",0)).putExtra(AlarmClock.EXTRA_MESSAGE,arg(a,"text","שעון מעורר מהלן"));startActivity(alarm);break;}
+ case "note_add":notes.add(arg(a,"text",""));saveLists();break;
+ case "task_add":tasks.add(arg(a,"text",""));saveLists();break;
+ case "shopping_add":shopping.add(arg(a,"text",""));saveLists();break;
+ case "expense_add":{float total=prefs.getFloat("expenses",0)+(float)a.optDouble("amount",0);prefs.edit().putFloat("expenses",total).apply();break;}
+ case "water_add":{int total=prefs.getInt("water",0)+Math.max(1,a.optInt("cups",1));prefs.edit().putInt("water",total).apply();break;}
+ case "web_search":case "transit_search":{String q=Uri.encode(arg(a,"query",""));startActivity(new Intent(Intent.ACTION_VIEW,Uri.parse("https://www.google.com/search?q="+q)));break;}
+ case "knowledge_search":searchKnowledge(arg(a,"query",""));break;
+ case "hebrew_date":showHebrewDate();break; case "calendar_add":{long when=System.currentTimeMillis()+Math.max(1,a.optInt("minutes",30))*60000L;Intent event=new Intent(Intent.ACTION_INSERT,android.provider.CalendarContract.Events.CONTENT_URI).putExtra(android.provider.CalendarContract.Events.TITLE,arg(a,"title","אירוע מהלן")).putExtra(android.provider.CalendarContract.EXTRA_EVENT_BEGIN_TIME,when).putExtra(android.provider.CalendarContract.EXTRA_EVENT_END_TIME,when+3600000L);startActivity(event);break;} case "read_screen":{HelenAccessibilityService svc=HelenAccessibilityService.get();if(svc!=null)reply(svc.readScreen());else reply("כדי לקרוא את המסך, הפעילי את שירות הנגישות בהגדרות.");break;} 
+ default:reply("המודל הציע פעולה שאינה זמינה כרגע: "+tool);
+ }}catch(Exception e){reply("לא הצלחתי לבצע את הפעולה: "+e.getMessage());}}
+ void openNamedApp(String name){if(name==null||name.trim().isEmpty()){reply("איזו אפליקציה לפתוח?");return;}String q=name.toLowerCase(Locale.ROOT);String[] known={"com.whatsapp","com.google.android.youtube","com.google.android.apps.maps","com.tranzmate","com.android.chrome","com.google.android.gm"};for(String pkg:known){try{String label=getPackageManager().getApplicationLabel(getPackageManager().getApplicationInfo(pkg,0)).toString().toLowerCase(Locale.ROOT);if(q.contains(label)||label.contains(q)){launchPackage(pkg);return;}}catch(Exception ignored){}}for(android.content.pm.ApplicationInfo appInfo:getPackageManager().getInstalledApplications(0)){String label=getPackageManager().getApplicationLabel(appInfo).toString();if(label.toLowerCase(Locale.ROOT).contains(q)){launchPackage(appInfo.packageName);return;}}reply("לא מצאתי אפליקציה בשם "+name+".");}
+ void setBrightness(int percent){try{if(!Settings.System.canWrite(this)){startActivity(new Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS,Uri.parse("package:"+getPackageName())));reply("אשרי להלן הרשאת שינוי בהירות, ואז נסי שוב.");return;}int value=Math.max(1,Math.min(255,percent*255/100));Settings.System.putInt(getContentResolver(),Settings.System.SCREEN_BRIGHTNESS,value);reply("הבהירות עודכנה ל־"+percent+"%.");}catch(Exception e){reply("לא הצלחתי לשנות בהירות.");}}
+ void setRinger(String mode){try{NotificationManager nm=(NotificationManager)getSystemService(NOTIFICATION_SERVICE);if("silent".equals(mode)&&!nm.isNotificationPolicyAccessGranted()){startActivity(new Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS));reply("צריך לאשר להלן גישה למדיניות 'נא לא להפריע'.");return;}AudioManager am=(AudioManager)getSystemService(AUDIO_SERVICE);am.setRingerMode("silent".equals(mode)?AudioManager.RINGER_MODE_SILENT:AudioManager.RINGER_MODE_NORMAL);}catch(Exception e){reply("לא ניתן לשנות מצב צלצול ללא הרשאה מתאימה.");}}
+ void reply(String s){bubble("הלן: "+s);if(tts!=null){tts.setSpeechRate(prefs.getFloat("speech_rate",1f));tts.speak(s,TextToSpeech.QUEUE_FLUSH,null,"helen");}}
+ void launchPackage(String p){Intent i=getPackageManager().getLaunchIntentForPackage(p);if(i!=null)startActivity(i);else reply("האפליקציה לא נמצאה במכשיר.");}
+ void toggleTorch(){try{CameraManager c=(CameraManager)getSystemService(CAMERA_SERVICE);String id=c.getCameraIdList()[0];torch=!torch;c.setTorchMode(id,torch);reply(torch?"הפנס דולק.":"כיביתי את הפנס.");}catch(Exception e){reply("לא הצלחתי להפעיל פנס. בדקי הרשאת מצלמה.");}}
+ void voice(){try{Intent i=new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);i.putExtra(RecognizerIntent.EXTRA_LANGUAGE,"he-IL");i.putExtra(RecognizerIntent.EXTRA_PROMPT,"מה תרצי שאעשה?");startActivityForResult(i,22);}catch(Exception e){reply("זיהוי קולי אינו זמין במכשיר.");}}
+ @Override protected void onActivityResult(int r,int c,Intent d){super.onActivityResult(r,c,d);if(c==RESULT_OK&&d!=null){if(r==22){ArrayList<String> a=d.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS);if(a!=null&&!a.isEmpty())handle(a.get(0));}if(r==23||r==24){Uri u=d.getData();if(u!=null)try{if(r==24&&exportPending){java.io.OutputStream os=getContentResolver().openOutputStream(u);os.write(makeBackup().getBytes(java.nio.charset.StandardCharsets.UTF_8));os.close();exportPending=false;reply("הגיבוי נשמר בהצלחה.");return;}java.io.InputStream in=getContentResolver().openInputStream(u);java.io.ByteArrayOutputStream out=new java.io.ByteArrayOutputStream();byte[] buf=new byte[8192];int n;while((n=in.read(buf))>0)out.write(buf,0,n);in.close();String v=new String(out.toByteArray(),java.nio.charset.StandardCharsets.UTF_8);if(r==23){knowledge=v;prefs.edit().putString("knowledge",v).apply();reply("מאגר הידע נטען בהצלחה.");}else restoreBackup(v);}catch(Exception e){reply("לא הצלחתי לקרוא את הקובץ.");}}}}
+ void scheduleReminder(String raw){int mins=10;java.util.regex.Matcher m=java.util.regex.Pattern.compile("(\\d+)\\s*(דקות|דקה|שעות|שעה)").matcher(raw);if(m.find()){mins=Integer.parseInt(m.group(1));if(m.group(2).startsWith("שע"))mins*=60;}String title=raw;long when=System.currentTimeMillis()+mins*60000L;Intent i=new Intent(this,ReminderReceiver.class).putExtra("title",title);PendingIntent pi=PendingIntent.getBroadcast(this,(int)(System.currentTimeMillis()%100000),i,PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE);AlarmManager am=(AlarmManager)getSystemService(ALARM_SERVICE);if(Build.VERSION.SDK_INT>=31&&!am.canScheduleExactAlarms()){startActivity(new Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM));reply("צריך לאשר הרשאת תזכורות מדויקות בהגדרות.");return;}am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP,when,pi);reply("קבעתי תזכורת לעוד "+mins+" דקות.");}
+ void showHebrewDate(){HebrewCalendar h=new HebrewCalendar();String date=h.get(HebrewCalendar.DAY_OF_MONTH)+"/"+(h.get(HebrewCalendar.MONTH)+1)+"/"+h.get(HebrewCalendar.YEAR);reply("התאריך העברי היום הוא "+date+". לחישוב מדויק של זמני יום לפי עיר נדרש מיקום והרשאה.");}
+ void addEntry(String key){EditText e=new EditText(this);e.setHint("מה להוסיף?");new AlertDialog.Builder(this).setTitle("פריט חדש").setView(e).setPositiveButton("שמירה",(d,w)->{String v=e.getText().toString().trim();if(!v.isEmpty()){(key.equals("notes")?notes:key.equals("tasks")?tasks:shopping).add(v);saveLists();renderTab();}}).setNegativeButton("ביטול",null).show();}
+ void saveLists(){prefs.edit().putStringSet("notes",new HashSet<>(notes)).putStringSet("tasks",new HashSet<>(tasks)).putStringSet("shopping",new HashSet<>(shopping)).apply();}
+ void expense(){EditText e=new EditText(this);e.setInputType(8194);e.setHint("סכום בש״ח");new AlertDialog.Builder(this).setTitle("הוספת הוצאה").setView(e).setPositiveButton("שמירה",(d,w)->{try{float n=Float.parseFloat(e.getText().toString());float total=prefs.getFloat("expenses",0)+n;prefs.edit().putFloat("expenses",total).apply();reply("נרשמה הוצאה. סך ההוצאות שנשמר: "+total+" ש״ח.");}catch(Exception ex){reply("הסכום אינו תקין.");}}).setNegativeButton("ביטול",null).show();}
+ void importKnowledge(){Intent i=new Intent(Intent.ACTION_OPEN_DOCUMENT).setType("text/*").addCategory(Intent.CATEGORY_OPENABLE);startActivityForResult(i,23);}
+ void searchKnowledge(String q){if(q==null||q.trim().isEmpty())return;String low=knowledge.toLowerCase(Locale.ROOT);int at=low.indexOf(q.toLowerCase(Locale.ROOT));if(at<0){reply("לא מצאתי את הביטוי במאגר המקומי.");return;}int a=Math.max(0,at-180),b=Math.min(knowledge.length(),at+Math.max(300,q.length()));reply("מצאתי במאגר: "+knowledge.substring(a,b));}
+ String makeBackup(){String raw=String.join("\n",notes)+"\n--TASKS--\n"+String.join("\n",tasks)+"\n--SHOPPING--\n"+String.join("\n",shopping)+"\n--KNOWLEDGE--\n"+knowledge;return "HELEN_BACKUP\n"+android.util.Base64.encodeToString(raw.getBytes(java.nio.charset.StandardCharsets.UTF_8),android.util.Base64.NO_WRAP);}
+ void exportBackup(){exportPending=true;Intent i=new Intent(Intent.ACTION_CREATE_DOCUMENT).setType("text/plain").putExtra(Intent.EXTRA_TITLE,"helen-backup.txt");startActivityForResult(i,24);reply("בחרי מיקום לשמירת קובץ הגיבוי.");}
+ void importBackup(){Intent i=new Intent(Intent.ACTION_OPEN_DOCUMENT).setType("text/*").addCategory(Intent.CATEGORY_OPENABLE);startActivityForResult(i,24);}
+ void restoreBackup(String s){try{if(!s.startsWith("HELEN_BACKUP\n"))throw new Exception();String raw=new String(android.util.Base64.decode(s.substring(13).trim(),android.util.Base64.DEFAULT),java.nio.charset.StandardCharsets.UTF_8);String[] parts=raw.split("\\n--TASKS--\\n|\\n--SHOPPING--\\n|\\n--KNOWLEDGE--\\n",-1);notes.clear();tasks.clear();shopping.clear();if(parts.length>0&&!parts[0].isEmpty())notes.addAll(Arrays.asList(parts[0].split("\\n")));if(parts.length>1&&!parts[1].isEmpty())tasks.addAll(Arrays.asList(parts[1].split("\\n")));if(parts.length>2&&!parts[2].isEmpty())shopping.addAll(Arrays.asList(parts[2].split("\\n")));knowledge=parts.length>3?parts[3]:"";prefs.edit().putString("knowledge",knowledge).apply();saveLists();reply("הגיבוי שוחזר בהצלחה.");}catch(Exception e){reply("קובץ הגיבוי אינו תקין.");}}
+ @Override protected void onDestroy(){if(tts!=null)tts.shutdown();if(ai!=null)ai.close();if(suggestionTask!=null)aiHandler.removeCallbacks(suggestionTask);super.onDestroy();}
 }

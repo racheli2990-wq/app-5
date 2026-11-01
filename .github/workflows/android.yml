@@ -1,4 +1,4 @@
-name: Build Helen AI 3 APK
+name: Build Helen AI 4 APK
 on:
   push:
     branches: [ main ]
@@ -40,6 +40,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: helen-gemma4-build-${{ github.run_number }}
-          name: Helen AI Gemma 4 build ${{ github.run_number }}
+          name: Helen AI 4.0 Gemma 4 build ${{ github.run_number }}
           prerelease: true
           files: app/build/outputs/apk/debug/app-debug.apk
