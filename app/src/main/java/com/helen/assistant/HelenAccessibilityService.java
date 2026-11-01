@@ -12,6 +12,8 @@ public class HelenAccessibilityService extends AccessibilityService{
  public boolean scroll(boolean down){AccessibilityNodeInfo n=getRootInActiveWindow();if(n==null)return false;return n.performAction(down?AccessibilityNodeInfo.ACTION_SCROLL_FORWARD:AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD);}
  public boolean tap(float x,float y){Path p=new Path();p.moveTo(x,y);GestureDescription g=new GestureDescription.Builder().addStroke(new GestureDescription.StrokeDescription(p,0,80)).build();return dispatchGesture(g,null,null);}
  public boolean typeText(String text){AccessibilityNodeInfo n=getRootInActiveWindow();if(n==null)return false;return setText(n,text);}
+ public String readScreen(){AccessibilityNodeInfo root=getRootInActiveWindow();if(root==null)return "אין אפשרות לקרוא את המסך כרגע.";StringBuilder out=new StringBuilder();collectText(root,out);String value=out.toString().trim();return value.isEmpty()?"לא נמצא טקסט קריא במסך.":value.substring(0,Math.min(2500,value.length()));}
+ private void collectText(AccessibilityNodeInfo node,StringBuilder out){if(node==null||out.length()>2500)return;CharSequence t=node.getText();if(t!=null&&!t.toString().trim().isEmpty())out.append(t).append(". ");CharSequence d=node.getContentDescription();if(d!=null&&!d.toString().trim().isEmpty())out.append(d).append(". ");for(int i=0;i<node.getChildCount();i++)collectText(node.getChild(i),out);}
  private boolean setText(AccessibilityNodeInfo n,String text){
   if(n==null)return false;
   if(n.isEditable()){android.os.Bundle b=new android.os.Bundle();b.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,text);return n.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT,b);}

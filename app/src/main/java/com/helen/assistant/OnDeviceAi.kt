@@ -3,23 +3,26 @@ package com.helen.assistant
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
-import android.net.Uri
 import com.google.ai.edge.litertlm.Backend
 import com.google.ai.edge.litertlm.Contents
 import com.google.ai.edge.litertlm.Conversation
 import com.google.ai.edge.litertlm.ConversationConfig
 import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.EngineConfig
+import com.google.ai.edge.litertlm.ExperimentalApi
+import com.google.ai.edge.litertlm.ExperimentalFlags
+import com.google.ai.edge.litertlm.Message
+import com.google.ai.edge.litertlm.MessageCallback
 import com.google.ai.edge.litertlm.SamplerConfig
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
-/**
- * Owns the LiteRT-LM engine and all conversations on one executor.
- * Model weights are bundled in the APK and copied once into app-private storage.
- */
+/** Local Gemma 4 runtime. The large weight file is downloaded once and kept offline. */
 class OnDeviceAi(context: Context) : AutoCloseable {
     interface ModelListener {
         fun onProgress(percent: Int, status: String)
@@ -27,6 +30,7 @@ class OnDeviceAi(context: Context) : AutoCloseable {
         fun onError(message: String)
     }
     interface AiCallback {
+        fun onProgress()
         fun onSuccess(text: String)
         fun onError(message: String)
     }
@@ -38,186 +42,213 @@ class OnDeviceAi(context: Context) : AutoCloseable {
     private val worker = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
     private val modelDir = File(app.filesDir, "models").apply { mkdirs() }
-    private val modelFile = File(modelDir, "qwen3_0.6b_nothink_q4_block32_ekv1280.litertlm")
+    private val modelFile = File(modelDir, MODEL_NAME)
+    private val partialFile = File(modelDir, "$MODEL_NAME.part")
     @Volatile private var ready = false
+    @Volatile private var activeBackend = "בהכנה"
     private var engine: Engine? = null
     private var chat: Conversation? = null
     private var completion: Conversation? = null
 
     companion object {
-        const val MODEL_BYTES_APPROX = 347_000_000L
-        const val MODEL_URL =
-            "https://huggingface.co/litert-community/Qwen3-0.6B-int4/resolve/main/qwen3_0.6b_nothink_q4_block32_ekv1280.litertlm?download=true"
-        private const val MIN_VALID_BYTES = 300_000_000L
+        const val MODEL_NAME = "gemma-4-E2B-it.litertlm"
+        const val MODEL_BYTES_APPROX = 2_583_000_000L
+        const val MODEL_URL = "https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/main/gemma-4-E2B-it.litertlm?download=true"
+        private const val MIN_VALID_BYTES = 2_400_000_000L
         private const val SYSTEM_PROMPT = """
-You are HELEN, a Hebrew-first personal assistant running locally on an Android phone.
-Always understand natural Hebrew, colloquial phrases, incomplete wording and context from prior turns.
-Return ONLY one valid JSON object, without markdown and without text outside JSON:
-{"reply":"short natural Hebrew response","actions":[{"tool":"tool_name","argument":"value"}]}
-For an ordinary question or conversation, use an empty actions array and answer in Hebrew.
-You may return several actions for one sentence. Never invent that an action succeeded.
-Available tools:
-- flashlight: enabled (boolean)
-- open_app: app (string, app name)
-- camera: no arguments
-- dial: number (string). Open dialer only, never place a call.
-- whatsapp: message (string, optional). Open WhatsApp/share confirmation only, never send automatically.
-- volume: direction ("up" or "down") OR percent (integer 0..100)
-- brightness: percent (integer 0..100); the app may ask for Android permission.
-- ringer: mode ("normal" or "silent"). Respect Android permission rules.
-- wifi_settings, bluetooth_settings: no arguments; open the Android settings/panel.
-- scroll: direction ("up" or "down"); requires user-enabled accessibility service.
-- tap: x and y screen coordinates; only when user explicitly asks and accessibility is enabled.
-- type_text: text; only in focused field and when accessibility is enabled.
-- back, home, screenshot: no arguments; requires accessibility service.
-- reminder: minutes (integer) and text (string).
-- timer: seconds (integer) and text (string).
-- alarm: hour (0..23), minute (0..59), text (string).
-- note_add, task_add, shopping_add: text (string).
-- expense_add: amount (number).
-- water_add: cups (integer, default 1).
-- web_search: query (string), for external lookup only when explicitly requested.
-- transit_search: query (string), open a public transit/maps search.
-- knowledge_search: query (string), search the user's imported local text file.
-- hebrew_date: no arguments.
-Important safety and accuracy rules:
-- If a request needs a missing essential detail (such as phone number, reminder time, or text), ask one concise question and do not emit an action.
-- Never send messages, place calls, buy, delete, or change a security setting by itself. Open the relevant app/confirmation screen instead.
-- For Wi-Fi and Bluetooth, open settings; Android does not allow ordinary apps to silently toggle these radios.
-- Don't claim to control other apps' private UI unless the accessibility service is enabled.
-- Keep responses brief, helpful, warm and non-childish. Use the conversation context for pronouns such as "turn it off".
+You are HELEN, a Hebrew-first personal assistant running locally on Android.
+Understand modern Hebrew, colloquial speech, typos, incomplete sentences, pronouns and prior conversation context.
+Reply naturally in Hebrew unless the user uses another language. Be clear, accurate and concise.
+
+For every response return ONLY one valid JSON object:
+{"reply":"short natural Hebrew response","actions":[{"tool":"tool_name","args":{"key":"value"}}]}
+For ordinary questions or conversation use "actions":[].
+A single sentence may request multiple actions. Use only tools listed below.
+Never claim an action succeeded until the app confirms it.
+
+TOOLS:
+- flashlight: {"enabled":true|false}
+- open_app: {"app":"application name"}
+- camera: {}
+- dial: {"number":"phone number"} (open dialer only; never place a call)
+- whatsapp: {"message":"optional text"} (open WhatsApp/share confirmation only; never send silently)
+- volume: {"direction":"up"|"down"} or {"percent":0..100}
+- brightness: {"percent":0..100}
+- ringer: {"mode":"normal"|"silent"}
+- wifi_settings, bluetooth_settings: {}
+- scroll: {"direction":"up"|"down"} (accessibility service required)
+- tap: {"x":number,"y":number} (only on explicit request; accessibility required)
+- type_text: {"text":"text"} (focused field and accessibility required)
+- back, home, screenshot, read_screen: {}
+- reminder: {"minutes":integer,"text":"reminder"}
+- timer: {"seconds":integer,"text":"label"}
+- alarm: {"hour":0..23,"minute":0..59,"text":"label"}
+- note_add, task_add, shopping_add: {"text":"content"}
+- expense_add: {"amount":number}
+- water_add: {"cups":integer}
+- calendar_add: {"title":"event","minutes":integer from now}
+- web_search, transit_search: {"query":"search phrase"} (only when explicitly requested)
+- knowledge_search: {"query":"phrase in imported local file"}
+- hebrew_date: {}
+
+RULES:
+- If an essential detail is missing, ask one short question and emit no action.
+- Never send a message, place a call, delete content, purchase anything or alter a security setting silently.
+- For Wi-Fi/Bluetooth, open Android settings; do not claim the radios were toggled.
+- Brightness and silent mode may require explicit Android permission.
+- Screen taps, typing, scrolling and screenshots require the user's explicit accessibility opt-in.
+- If a service is unavailable, explain which permission is needed.
+- Keep replies concise and don't invent details.
 """
     }
 
     fun isReady(): Boolean = ready
+    fun backendName(): String = activeBackend
     fun hasModel(): Boolean = modelFile.exists() && modelFile.length() >= MIN_VALID_BYTES
     fun modelPath(): String = modelFile.absolutePath
+    fun partialBytes(): Long = if (partialFile.exists()) partialFile.length() else 0L
 
     fun prepare(listener: ModelListener) {
         worker.execute {
             try {
-                if (!hasModel()) {
-                    try {
-                        app.assets.open(modelFile.name).use { input ->
-                            modelFile.outputStream().buffered().use { output ->
-                                val buffer = ByteArray(64 * 1024)
-                                var copied = 0L
-                                var read: Int
-                                while (input.read(buffer).also { read = it } != -1) {
-                                    output.write(buffer, 0, read)
-                                    copied += read
-                                    postProgress(listener, ((copied * 100) / MODEL_BYTES_APPROX).toInt().coerceAtMost(99),
-                                        "מכינה את מודל ה־AI המובנה… ${formatMb(copied)} MB")
-                                }
-                            }
-                        }
-                    } catch (_: Throwable) {
-                        if (!hasModel()) downloadModel(listener)
-                    }
-                } else {
-                    postProgress(listener, 100, "המודל המקומי נמצא. טוענת את המנוע…")
-                }
-                if (!hasModel()) throw IllegalStateException("קובץ מודל ה־AI חסר או לא תקין")
+                if (!hasModel()) downloadModel(listener)
+                postProgress(listener, 100, "Gemma 4 הורד. מאתחלת מנוע AI…")
+                if (!hasModel()) throw IllegalStateException("קובץ המודל לא תקין")
                 initializeModel()
                 ready = true
                 main.post { listener.onReady() }
             } catch (t: Throwable) {
                 ready = false
-                main.post { listener.onError(t.message ?: "טעינת מודל ה־AI נכשלה") }
+                main.post { listener.onError(t.message ?: "טעינת מודל AI נכשלה") }
             }
         }
     }
 
     private fun downloadModel(listener: ModelListener) {
-        postProgress(listener, 0, "מורידה מודל AI מקומי (כ־475 MiB)…")
-        val part = File(modelDir, modelFile.name + ".part")
-        if (part.exists()) part.delete()
+        var existing = if (partialFile.exists()) partialFile.length() else 0L
+        if (existing > MODEL_BYTES_APPROX) {
+            partialFile.delete()
+            existing = 0L
+        }
+        val needed = (MODEL_BYTES_APPROX - existing).coerceAtLeast(0L) + 500_000_000L
+        if (modelDir.usableSpace < needed) {
+            throw IllegalStateException("אין מספיק מקום פנוי. נדרשים עוד כ־${formatMb(needed)}MB פנויים להשלמת ההורדה וההכנה.")
+        }
+        postProgress(listener, if (existing > 0) ((existing * 100) / MODEL_BYTES_APPROX).toInt() else 0,
+            if (existing > 0) "ממשיכה הורדת Gemma 4 מהמקום שבו נעצרה…" else "מורידה Gemma 4 · כ־2.58GB")
         val connection = (URL(MODEL_URL).openConnection() as HttpURLConnection).apply {
             connectTimeout = 30_000
-            readTimeout = 180_000
+            readTimeout = 240_000
             instanceFollowRedirects = true
-            setRequestProperty("User-Agent", "Helen-Android/2.0")
+            setRequestProperty("User-Agent", "Helen-AI-3.0")
             setRequestProperty("Accept-Encoding", "identity")
+            if (existing > 0) setRequestProperty("Range", "bytes=$existing-")
         }
         try {
             connection.connect()
             val code = connection.responseCode
             if (code !in 200..299) throw IllegalStateException("שרת המודל החזיר HTTP $code")
-            val total = connection.contentLengthLong
-            var received = 0L
+            val append = existing > 0 && code == HttpURLConnection.HTTP_PARTIAL
+            if (existing > 0 && !append) {
+                partialFile.delete()
+                existing = 0L
+            }
+            val total = if (connection.contentLengthLong > 0) existing + connection.contentLengthLong else MODEL_BYTES_APPROX
+            var received = existing
+            val output = if (append) {
+                java.io.FileOutputStream(partialFile, true).buffered(1024 * 1024)
+            } else {
+                partialFile.outputStream().buffered(1024 * 1024)
+            }
             connection.inputStream.use { input ->
-                part.outputStream().buffered().use { output ->
-                    val buffer = ByteArray(64 * 1024)
+                output.use { out ->
+                    val buffer = ByteArray(1024 * 1024)
                     var read: Int
                     var lastPercent = -1
                     while (input.read(buffer).also { read = it } != -1) {
-                        output.write(buffer, 0, read)
+                        out.write(buffer, 0, read)
                         received += read
-                        val percent = if (total > 0) ((received * 100) / total).toInt() else -1
+                        val percent = ((received * 100L) / total).toInt().coerceIn(0, 99)
                         if (percent != lastPercent) {
                             lastPercent = percent
-                            postProgress(listener, percent, "מורידה מודל AI… ${formatMb(received)} MB")
+                            postProgress(listener, percent, "מורידה מודל AI · ${formatMb(received)}MB / כ־2,583MB")
                         }
                     }
-                    output.flush()
+                    out.flush()
                 }
             }
-            if (received < MIN_VALID_BYTES) throw IllegalStateException("קובץ המודל שהתקבל קטן מדי או פגום")
-            if (modelFile.exists()) modelFile.delete()
-            if (!part.renameTo(modelFile)) {
-                part.copyTo(modelFile, overwrite = true)
-                part.delete()
+            if (partialFile.length() < MIN_VALID_BYTES) {
+                throw IllegalStateException("ההורדה הסתיימה מוקדם מדי. אפשר לנסות שוב וההורדה תמשיך.")
             }
-            postProgress(listener, 100, "המודל ירד. מאתחלת AI מקומי…")
+            if (modelFile.exists()) modelFile.delete()
+            if (!partialFile.renameTo(modelFile)) {
+                partialFile.copyTo(modelFile, overwrite = true)
+                partialFile.delete()
+            }
         } finally {
             connection.disconnect()
-            if (part.exists()) part.delete()
         }
     }
 
-    private fun formatMb(bytes: Long): String = String.format("%.0f", bytes / (1024.0 * 1024.0))
-    private fun postProgress(listener: ModelListener, percent: Int, status: String) {
-        main.post { listener.onProgress(percent, status) }
-    }
-
+    @OptIn(ExperimentalApi::class)
     private fun initializeModel() {
-        val config = EngineConfig(
-            modelPath = modelFile.absolutePath,
-            backend = Backend.CPU(),
-            cacheDir = File(app.cacheDir, "litert-cache").apply { mkdirs() }.absolutePath
-        )
-        val candidate = Engine(config)
-        candidate.initialize()
-        val sampler = SamplerConfig(topK = 32, topP = 0.9, temperature = 0.25)
-        val chatConversation = candidate.createConversation(
-            ConversationConfig(
+        ExperimentalFlags.enableSpeculativeDecoding = true
+        val cache = File(app.cacheDir, "gemma4-cache").apply { mkdirs() }
+        var selected: Engine? = null
+        var gpuReady = false
+        try {
+            val gpu = Engine(EngineConfig(
+                modelPath = modelFile.absolutePath,
+                backend = Backend.GPU(),
+                cacheDir = cache.absolutePath
+            ))
+            gpu.initialize()
+            selected = gpu
+            gpuReady = true
+            activeBackend = "GPU מואץ + MTP"
+        } catch (_: Throwable) {
+            // Some phones do not expose a compatible OpenCL driver. Retry with CPU.
+        }
+        if (!gpuReady) {
+            val cpu = Engine(EngineConfig(
+                modelPath = modelFile.absolutePath,
+                backend = Backend.CPU(),
+                cacheDir = File(app.cacheDir, "gemma4-cpu-cache").apply { mkdirs() }.absolutePath
+            ))
+            cpu.initialize()
+            selected = cpu
+            activeBackend = "CPU + MTP"
+        }
+        val sampler = SamplerConfig(topK = 24, topP = 0.88, temperature = 0.2)
+        try {
+            val chatConversation = selected!!.createConversation(ConversationConfig(
                 systemInstruction = Contents.of(SYSTEM_PROMPT),
                 samplerConfig = sampler
-            )
-        )
-        val completionConversation = candidate.createConversation(
-            ConversationConfig(
+            ))
+            val completionConversation = selected!!.createConversation(ConversationConfig(
                 systemInstruction = Contents.of(
-                    "את מנוע השלמת מילים בעברית. קבלי טקסט חלקי והחזירי בדיוק 3 המשכים טבעיים וקצרים בעברית, " +
-                    "כל אפשרות בשורה נפרדת, בלי מספור, בלי הסברים ובלי מרכאות. השלימי את המשפט של המשתמש, " +
-                    "אל תעני על הפקודה עצמה. אם אין מספיק הקשר, החזירי 2 הצעות קצרות."
+                    "את מנוע השלמת המשפטים של הלן. החזירי 3 המשכים טבעיים וקצרים בעברית, " +
+                    "אפשרות אחת בכל שורה, ללא מספור או הסברים. השלימי את הניסוח ואל תעני לפקודה עצמה."
                 ),
-                samplerConfig = SamplerConfig(topK = 24, topP = 0.88, temperature = 0.35)
-            )
-        )
-        engine = candidate
-        chat = chatConversation
-        completion = completionConversation
+                samplerConfig = SamplerConfig(topK = 20, topP = 0.85, temperature = 0.35)
+            ))
+            engine = selected
+            chat = chatConversation
+            completion = completionConversation
+        } catch (t: Throwable) {
+            try { selected?.close() } catch (_: Throwable) {}
+            throw t
+        }
     }
 
     fun ask(userText: String, callback: AiCallback) {
         worker.execute {
             try {
                 val conversation = chat ?: throw IllegalStateException("מודל ה־AI עדיין לא מוכן")
-                val answer = conversation.sendMessage(userText).toString()
-                main.post { callback.onSuccess(answer) }
+                val result = streamMessage(conversation, userText) { callback.onProgress() }
+                main.post { callback.onSuccess(result) }
             } catch (t: Throwable) {
-                main.post { callback.onError(t.message ?: "שגיאה בהרצת מודל ה־AI") }
+                main.post { callback.onError(t.message ?: "שגיאה בהרצת Gemma 4") }
             }
         }
     }
@@ -229,20 +260,42 @@ Important safety and accuracy rules:
         }
         worker.execute {
             try {
-                val prompt = "השלימי את הפקודה או המשפט הבא ותני הצעות שימושיות:\n$partialText"
-                val raw = completion?.sendMessage(prompt)?.toString().orEmpty()
-                val suggestions = raw
-                    .lineSequence()
-                    .map { it.trim().removePrefix("-").trim().removePrefix("•").trim() }
-                    .filter { it.isNotBlank() && it.length <= 100 && !it.startsWith("{") }
-                    .distinct()
-                    .take(3)
-                    .toList()
-                main.post { callback.onSuggestions(suggestions) }
+                val prompt = "השלימי את המשפט או הפקודה הבאים:\n$partialText"
+                val raw = streamMessage(completion ?: throw IllegalStateException("מנוע ההשלמה אינו זמין"), prompt)
+                val items = raw.replace("\r", "").lineSequence()
+                    .map { it.trim().removePrefix("-").removePrefix("•").trim() }
+                    .filter { it.isNotBlank() && it.length <= 90 && !it.startsWith("{") }
+                    .distinct().take(3).toList()
+                main.post { callback.onSuggestions(items) }
             } catch (_: Throwable) {
                 main.post { callback.onSuggestions(emptyList()) }
             }
         }
+    }
+
+    private fun streamMessage(conversation: Conversation, prompt: String, onChunk: (() -> Unit)? = null): String {
+        val output = StringBuilder()
+        val error = AtomicReference<Throwable?>(null)
+        val latch = CountDownLatch(1)
+        conversation.sendMessageAsync(prompt, object : MessageCallback {
+            override fun onMessage(message: Message) {
+                output.append(message.text)
+                onChunk?.invoke()
+            }
+            override fun onDone() { latch.countDown() }
+            override fun onError(throwable: Throwable) {
+                error.set(throwable)
+                latch.countDown()
+            }
+        })
+        if (!latch.await(5, TimeUnit.MINUTES)) throw IllegalStateException("המודל לא סיים בזמן. נסי שוב.")
+        error.get()?.let { throw it }
+        return output.toString()
+    }
+
+    private fun formatMb(bytes: Long): String = String.format("%.0f", bytes / (1024.0 * 1024.0))
+    private fun postProgress(listener: ModelListener, percent: Int, status: String) {
+        main.post { listener.onProgress(percent, status) }
     }
 
     override fun close() {
