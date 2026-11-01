@@ -1,4 +1,5 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+ <uses-permission android:name="android.permission.INTERNET"/>
  <uses-permission android:name="android.permission.CAMERA"/>
  <uses-permission android:name="android.permission.RECORD_AUDIO"/>
  <uses-permission android:name="android.permission.VIBRATE"/>
@@ -6,7 +7,7 @@
  <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM"/>
  <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>
  <uses-feature android:name="android.hardware.camera" android:required="false"/>
- <application android:theme="@style/HelenTheme" android:label="הלן" android:allowBackup="true" android:supportsRtl="true">
+ <application android:theme="@style/HelenTheme" android:label="הלן AI" android:allowBackup="true" android:supportsRtl="true">
   <activity android:name=".MainActivity" android:exported="true">
    <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
   </activity>
