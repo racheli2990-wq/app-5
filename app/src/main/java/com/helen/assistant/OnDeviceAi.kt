@@ -15,15 +15,14 @@ import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.MessageCallback
 import com.google.ai.edge.litertlm.SamplerConfig
 import java.io.File
-import java.net.HttpURLConnection
-import java.net.URL
+import java.io.FileOutputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.atomic.AtomicInteger
 
-/** Local Gemma 4 runtime. The large weight file is downloaded once and kept offline. */
+/** Local Qwen3 runtime. The model is packaged inside the APK and copied to private storage on first launch. */
 class OnDeviceAi(context: Context) : AutoCloseable {
     interface ModelListener {
         fun onProgress(percent: Int, status: String)
@@ -54,10 +53,9 @@ class OnDeviceAi(context: Context) : AutoCloseable {
     private val pendingChatRequests = AtomicInteger(0)
 
     companion object {
-        const val MODEL_NAME = "gemma-4-E2B-it.litertlm"
-        const val MODEL_BYTES_APPROX = 2_583_000_000L
-        const val MODEL_URL = "https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/main/gemma-4-E2B-it.litertlm?download=true"
-        private const val MIN_VALID_BYTES = 2_400_000_000L
+        const val MODEL_NAME = "qwen3_0.6b_nothink_q4_block32_ekv1280.litertlm"
+        const val MODEL_BYTES_APPROX = 347_000_000L
+        private const val MIN_VALID_BYTES = 300_000_000L
         private const val SYSTEM_PROMPT = """
 You are HELEN, a Hebrew-first personal assistant running locally on Android.
 Understand modern Hebrew, colloquial speech, typos, incomplete sentences, pronouns and prior conversation context.
@@ -123,8 +121,8 @@ RULES:
                     main.post { listener.onReady() }
                     return@execute
                 }
-                if (!hasModel()) downloadModel(listener)
-                postProgress(listener, 100, "Gemma 4 הורד. מאתחלת מנוע AI…")
+                if (!hasModel()) installBundledModel(listener)
+                postProgress(listener, 100, "מודל Qwen3 המובנה מוכן. מאתחלת מנוע AI…")
                 if (!hasModel()) throw IllegalStateException("קובץ המודל לא תקין")
                 initializeModel()
                 ready = true
@@ -136,91 +134,56 @@ RULES:
         }
     }
 
-    private fun downloadModel(listener: ModelListener) {
-        var existing = if (partialFile.exists()) partialFile.length() else 0L
-        if (existing > MODEL_BYTES_APPROX) {
-            partialFile.delete()
-            existing = 0L
+    /** Copies the model bundled in APK assets; this never uses the network. */
+    private fun installBundledModel(listener: ModelListener) {
+        if (modelDir.usableSpace < MODEL_BYTES_APPROX + 100_000_000L) {
+            throw IllegalStateException("אין מספיק מקום פנוי להעתקת מודל ה־AI המובנה. נדרשים כ־450MB פנויים.")
         }
-        val needed = (MODEL_BYTES_APPROX - existing).coerceAtLeast(0L) + 500_000_000L
-        if (modelDir.usableSpace < needed) {
-            throw IllegalStateException("אין מספיק מקום פנוי. נדרשים עוד כ־${formatMb(needed)}MB פנויים להשלמת ההורדה וההכנה.")
-        }
-        postProgress(listener, if (existing > 0) ((existing * 100) / MODEL_BYTES_APPROX).toInt() else 0,
-            if (existing > 0) "ממשיכה הורדת Gemma 4 מהמקום שבו נעצרה…" else "מורידה Gemma 4 · כ־2.58GB")
-        val connection = (URL(MODEL_URL).openConnection() as HttpURLConnection).apply {
-            connectTimeout = 30_000
-            readTimeout = 240_000
-            instanceFollowRedirects = true
-            setRequestProperty("User-Agent", "Helen-AI-3.0")
-            setRequestProperty("Accept-Encoding", "identity")
-            if (existing > 0) setRequestProperty("Range", "bytes=$existing-")
-        }
+        postProgress(listener, 0, "מעתיקה את מודל Qwen3 המובנה מהאפליקציה…")
+        val installingFile = File(modelDir, "$MODEL_NAME.installing")
         try {
-            connection.connect()
-            val code = connection.responseCode
-            if (code !in 200..299) throw IllegalStateException("שרת המודל החזיר HTTP $code")
-            val append = existing > 0 && code == HttpURLConnection.HTTP_PARTIAL
-            if (append) {
-                val contentRange = connection.getHeaderField("Content-Range").orEmpty()
-                if (!contentRange.startsWith("bytes $existing-")) {
-                    partialFile.delete()
-                    throw IllegalStateException("שרת המודל החזיר טווח לא תואם. נסי להוריד מחדש.")
-                }
-            }
-            if (existing > 0 && !append) {
-                partialFile.delete()
-                existing = 0L
-            }
-            val total = if (connection.contentLengthLong > 0) existing + connection.contentLengthLong else MODEL_BYTES_APPROX
-            var received = existing
-            val output = if (append) {
-                java.io.FileOutputStream(partialFile, true).buffered(1024 * 1024)
-            } else {
-                partialFile.outputStream().buffered(1024 * 1024)
-            }
-            connection.inputStream.use { input ->
-                output.use { out ->
+            app.assets.open(MODEL_NAME).buffered(1024 * 1024).use { input ->
+                FileOutputStream(installingFile).buffered(1024 * 1024).use { output ->
                     val buffer = ByteArray(1024 * 1024)
-                    var read: Int
+                    var received = 0L
                     var lastPercent = -1
-                    while (input.read(buffer).also { read = it } != -1) {
-                        out.write(buffer, 0, read)
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read < 0) break
+                        output.write(buffer, 0, read)
                         received += read
-                        val percent = ((received * 100L) / total).toInt().coerceIn(0, 99)
+                        val percent = ((received * 100L) / MODEL_BYTES_APPROX).toInt().coerceIn(0, 99)
                         if (percent != lastPercent) {
                             lastPercent = percent
-                            postProgress(listener, percent, "מורידה מודל AI · ${formatMb(received)}MB / כ־2,583MB")
+                            postProgress(listener, percent, "מכינה מודל AI מובנה · ${formatMb(received)}MB")
                         }
                     }
-                    out.flush()
+                    output.flush()
                 }
             }
-            if (total > 0 && received != total) {
-                throw IllegalStateException("הורדת המודל לא הושלמה. הקובץ נשמר ואפשר להמשיך מהנקודה שבה נעצר.")
+            if (installingFile.length() < MIN_VALID_BYTES) {
+                throw IllegalStateException("קובץ מודל ה־AI שבתוך ה־APK חסר או פגום.")
             }
-            if (partialFile.length() < MIN_VALID_BYTES) {
-                throw IllegalStateException("ההורדה הסתיימה מוקדם מדי. אפשר לנסות שוב וההורדה תמשיך.")
+            if (modelFile.exists() && !modelFile.delete()) {
+                throw IllegalStateException("לא ניתן להחליף את קובץ המודל הקודם.")
             }
-            if (modelFile.exists()) modelFile.delete()
-            if (!partialFile.renameTo(modelFile)) {
-                partialFile.copyTo(modelFile, overwrite = true)
-                partialFile.delete()
+            if (!installingFile.renameTo(modelFile)) {
+                installingFile.copyTo(modelFile, overwrite = true)
+                installingFile.delete()
             }
-        } finally {
-            connection.disconnect()
+            postProgress(listener, 100, "מודל Qwen3 הותקן מתוך ה־APK.")
+        } catch (t: Throwable) {
+            installingFile.delete()
+            throw t
         }
     }
 
-    @OptIn(ExperimentalApi::class)
     private fun initializeModel() {
-        val cache = File(app.cacheDir, "gemma4-cache").apply { mkdirs() }
+        val cache = File(app.cacheDir, "qwen3-cache").apply { mkdirs() }
         var selected: Engine? = null
         var gpuEngine: Engine? = null
         var gpuReady = false
         try {
-            // MTP accelerates Gemma 4 on GPU. CPU free-form generation can be slower with MTP.
-            ExperimentalFlags.enableSpeculativeDecoding = true
             gpuEngine = Engine(EngineConfig(
                 modelPath = modelFile.absolutePath,
                 backend = Backend.GPU(),
@@ -232,13 +195,12 @@ RULES:
             activeBackend = "GPU מואץ + MTP"
         } catch (_: Throwable) {
             try { gpuEngine?.close() } catch (_: Throwable) {}
-            ExperimentalFlags.enableSpeculativeDecoding = false
         }
         if (!gpuReady) {
             val cpu = Engine(EngineConfig(
                 modelPath = modelFile.absolutePath,
                 backend = Backend.CPU(),
-                cacheDir = File(app.cacheDir, "gemma4-cpu-cache").apply { mkdirs() }.absolutePath
+                cacheDir = File(app.cacheDir, "qwen3-cpu-cache").apply { mkdirs() }.absolutePath
             ))
             cpu.initialize()
             selected = cpu
