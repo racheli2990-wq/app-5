@@ -11,14 +11,18 @@ android {
         applicationId 'com.helen.assistant'
         minSdk 26
         targetSdk 35
-        versionCode 4
-        versionName '4.0 Gemma AI Fast'
+        versionCode 5
+        versionName '5.0 Qwen3 Bundled AI'
     }
 
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
+    androidResources {
+        noCompress += ['litertlm']
+    }
+
     kotlinOptions {
         jvmTarget = '17'
     }
