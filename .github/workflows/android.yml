@@ -1,4 +1,4 @@
-name: Build HELEN AI 6 - Bundled Qwen2.5 1.5B APK
+name: Build HELEN AI 7 - Bundled Qwen3 1.7B INT4 APK
 on:
   push:
     branches: [ main ]
@@ -17,38 +17,38 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-      - name: Download bundled Qwen2.5 1.5B INT8 LiteRT-LM model
+      - name: Download bundled Qwen3 1.7B INT4 LiteRT-LM model
         run: |
           mkdir -p app/src/main/assets
           curl --fail --location --retry 5 --retry-all-errors --silent --show-error \
-            "https://huggingface.co/litert-community/Qwen2.5-1.5B-Instruct/resolve/main/Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv4096.litertlm" \
-            -o "app/src/main/assets/Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv4096.litertlm"
-          MODEL_BYTES="$(stat -c%s app/src/main/assets/Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv4096.litertlm)"
-          echo "Bundled Qwen2.5 model size: ${MODEL_BYTES} bytes"
-          test "${MODEL_BYTES}" -ge 1500000000
-          test "${MODEL_BYTES}" -le 1800000000
+            "https://huggingface.co/litert-community/Qwen3-1.7B/resolve/main/Qwen3-1.7B_dynamic_wi4b32_afp32.litertlm" \
+            -o "app/src/main/assets/Qwen3-1.7B_dynamic_wi4b32_afp32.litertlm"
+          MODEL_BYTES="$(stat -c%s app/src/main/assets/Qwen3-1.7B_dynamic_wi4b32_afp32.litertlm)"
+          echo "Bundled Qwen3 INT4 model size: ${MODEL_BYTES} bytes"
+          test "${MODEL_BYTES}" -ge 850000000
+          test "${MODEL_BYTES}" -le 1100000000
       - name: Compile APK
         run: gradle --no-daemon assembleDebug
-      - name: Verify APK contains complete model asset
+      - name: Verify complete model is inside APK
         run: |
           APK="app/build/outputs/apk/debug/app-debug.apk"
           test -s "$APK"
-          unzip -l "$APK" | grep -F "assets/Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv4096.litertlm"
+          unzip -l "$APK" | grep -F "assets/Qwen3-1.7B_dynamic_wi4b32_afp32.litertlm"
           APK_BYTES="$(stat -c%s "$APK")"
           echo "APK size: ${APK_BYTES} bytes"
-          test "$APK_BYTES" -ge 1500000000
-          test "$APK_BYTES" -le 1900000000
+          test "$APK_BYTES" -ge 900000000
+          test "$APK_BYTES" -le 1300000000
           ls -lh "$APK"
       - uses: actions/upload-artifact@v4
         with:
-          name: helen-ai-qwen25-1.5b-bundled-apk
+          name: helen-ai-qwen3-1.7b-int4-bundled-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 30
       - name: Publish APK
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: helen-qwen25-1.5b-bundled-build-${{ github.run_number }}
-          name: HELEN AI 6.0 · Qwen2.5 1.5B bundled · build ${{ github.run_number }}
+          tag_name: helen-qwen3-1.7b-int4-build-${{ github.run_number }}
+          name: HELEN AI 7.0 · Qwen3 1.7B INT4 · build ${{ github.run_number }}
           prerelease: true
           files: app/build/outputs/apk/debug/app-debug.apk

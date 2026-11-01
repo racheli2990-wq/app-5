@@ -1,6 +1,7 @@
 package com.helen.assistant
 
 import android.content.Context
+import android.app.ActivityManager
 import android.os.Handler
 import android.os.Looper
 import com.google.ai.edge.litertlm.Backend
@@ -12,6 +13,7 @@ import com.google.ai.edge.litertlm.EngineConfig
 import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.MessageCallback
 import com.google.ai.edge.litertlm.SamplerConfig
+import com.google.ai.edge.litertlm.ThinkingConfig
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.CountDownLatch
@@ -20,7 +22,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.atomic.AtomicInteger
 
-/** Local Qwen2.5 1.5B runtime. Model weights ship inside the APK and are copied locally on first launch. */
+/** Local Qwen3 1.7B runtime. The GPU-optimized INT4 model ships inside the APK. */
 class OnDeviceAi(context: Context) : AutoCloseable {
     interface ModelListener {
         fun onProgress(percent: Int, status: String)
@@ -51,9 +53,9 @@ class OnDeviceAi(context: Context) : AutoCloseable {
     private val pendingChatRequests = AtomicInteger(0)
 
     companion object {
-        const val MODEL_NAME = "Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv4096.litertlm"
-        const val MODEL_BYTES_APPROX = 1_600_000_000L
-        private const val MIN_VALID_BYTES = 1_500_000_000L
+        const val MODEL_NAME = "Qwen3-1.7B_dynamic_wi4b32_afp32.litertlm"
+        const val MODEL_BYTES_APPROX = 980_000_000L
+        private const val MIN_VALID_BYTES = 850_000_000L
         private const val SYSTEM_PROMPT = """
 You are HELEN, a Hebrew-first personal assistant running locally on Android.
 Understand modern Hebrew, colloquial speech, typos, incomplete sentences, pronouns and prior conversation context.
@@ -120,7 +122,7 @@ RULES:
                     return@execute
                 }
                 if (!hasModel()) installBundledModel(listener)
-                postProgress(listener, 100, "מודל Qwen2.5 המובנה מוכן. מאתחלת מנוע AI…")
+                postProgress(listener, 100, "מודל Qwen3 1.7B המובנה מוכן. מאתחלת מנוע AI…")
                 if (!hasModel()) throw IllegalStateException("קובץ המודל לא תקין")
                 initializeModel()
                 ready = true
@@ -134,10 +136,14 @@ RULES:
 
     /** Copies the model bundled in APK assets; this never uses the network. */
     private fun installBundledModel(listener: ModelListener) {
-        if (modelDir.usableSpace < MODEL_BYTES_APPROX + 100_000_000L) {
-            throw IllegalStateException("אין מספיק מקום פנוי להעתקת מודל ה־AI המובנה. נדרשים כ־450MB פנויים.")
+        File(modelDir, "Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv4096.litertlm").delete()
+        File(modelDir, "qwen3_0.6b_nothink_q4_block32_ekv1280.litertlm").delete()
+        File(app.cacheDir, "qwen25-cache").deleteRecursively()
+        File(app.cacheDir, "qwen25-cpu-cache").deleteRecursively()
+        if (modelDir.usableSpace < MODEL_BYTES_APPROX + 150_000_000L) {
+            throw IllegalStateException("אין מספיק מקום פנוי להעתקת מודל ה־AI המובנה. נדרשים כ־1.1GB פנויים.")
         }
-        postProgress(listener, 0, "מעתיקה מודל AI מתקדם (1.5B) מתוך האפליקציה…")
+        postProgress(listener, 0, "מעתיקה את מודל Qwen3 1.7B מתוך קובץ ההתקנה…")
         val installingFile = File(modelDir, "$MODEL_NAME.installing")
         try {
             app.assets.open(MODEL_NAME).buffered(1024 * 1024).use { input ->
@@ -169,11 +175,13 @@ RULES:
                 installingFile.copyTo(modelFile, overwrite = true)
                 installingFile.delete()
             }
-            // Clean up the previous compact model after the new model is safely installed.
+            File(modelDir, "Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv4096.litertlm").delete()
             File(modelDir, "qwen3_0.6b_nothink_q4_block32_ekv1280.litertlm").delete()
+            File(app.cacheDir, "qwen25-cache").deleteRecursively()
+            File(app.cacheDir, "qwen25-cpu-cache").deleteRecursively()
             File(app.cacheDir, "qwen3-cache").deleteRecursively()
             File(app.cacheDir, "qwen3-cpu-cache").deleteRecursively()
-            postProgress(listener, 100, "מודל Qwen2.5 הותקן מתוך ה־APK.")
+            postProgress(listener, 100, "מודל Qwen3 1.7B הותקן מתוך ה־APK.")
         } catch (t: Throwable) {
             installingFile.delete()
             throw t
@@ -181,7 +189,7 @@ RULES:
     }
 
     private fun initializeModel() {
-        val cache = File(app.cacheDir, "qwen25-cache").apply { mkdirs() }
+        val cache = File(app.cacheDir, "qwen3-17b-cache").apply { mkdirs() }
         var selected: Engine? = null
         var gpuEngine: Engine? = null
         var gpuReady = false
@@ -199,16 +207,22 @@ RULES:
             try { gpuEngine?.close() } catch (_: Throwable) {}
         }
         if (!gpuReady) {
+            val activityManager = app.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            val memoryInfo = ActivityManager.MemoryInfo()
+            activityManager.getMemoryInfo(memoryInfo)
+            if (memoryInfo.availMem < 2_000_000_000L) {
+                throw IllegalStateException("הטלפון לא סיפק מספיק זיכרון פנוי להפעלת מודל 1.7B במעבד. מומלץ לסגור אפליקציות אחרות או להשתמש במכשיר עם האצת GPU וזיכרון פנוי רב יותר.")
+            }
             val cpu = Engine(EngineConfig(
                 modelPath = modelFile.absolutePath,
                 backend = Backend.CPU(),
-                cacheDir = File(app.cacheDir, "qwen25-cpu-cache").apply { mkdirs() }.absolutePath
+                cacheDir = File(app.cacheDir, "qwen3-17b-cpu-cache").apply { mkdirs() }.absolutePath
             ))
             cpu.initialize()
             selected = cpu
-            activeBackend = "CPU מותאם"
+            activeBackend = "CPU (איטי יותר · זיכרון גבוה)"
         }
-        val sampler = SamplerConfig(topK = 24, topP = 0.88, temperature = 0.2)
+        val sampler = SamplerConfig(topK = 20, topP = 0.95, temperature = 0.6)
         try {
             val restoredMessages = restoredHistory.mapNotNull { item ->
                 when {
@@ -221,15 +235,17 @@ RULES:
                 systemInstruction = Contents.of(SYSTEM_PROMPT),
                 initialMessages = restoredMessages,
                 samplerConfig = sampler,
-                maxOutputToken = 220
+                thinkingConfig = ThinkingConfig(enableThinking = true, thinkingTokenBudget = 160),
+                maxOutputToken = 320
             ))
             val completionConversation = selected!!.createConversation(ConversationConfig(
                 systemInstruction = Contents.of(
                     "את מנוע השלמת המשפטים של הלן. החזירי 3 המשכים טבעיים וקצרים בעברית, " +
                     "אפשרות אחת בכל שורה, ללא מספור או הסברים. השלימי את הניסוח ואל תעני לפקודה עצמה."
                 ),
-                samplerConfig = SamplerConfig(topK = 20, topP = 0.85, temperature = 0.35),
-                maxOutputToken = 56
+                samplerConfig = SamplerConfig(topK = 20, topP = 0.8, temperature = 0.55),
+                thinkingConfig = ThinkingConfig(enableThinking = false, thinkingTokenBudget = 0),
+                maxOutputToken = 64
             ))
             engine = selected
             chat = chatConversation
@@ -245,10 +261,10 @@ RULES:
         worker.execute {
             try {
                 val conversation = chat ?: throw IllegalStateException("מודל ה־AI עדיין לא מוכן")
-                val result = streamMessage(conversation, userText, 176) { callback.onProgress() }
+                val result = streamMessage(conversation, userText, 320) { callback.onProgress() }
                 main.post { callback.onSuccess(result) }
             } catch (t: Throwable) {
-                main.post { callback.onError(t.message ?: "שגיאה בהרצת מודל Qwen2.5") }
+                main.post { callback.onError(t.message ?: "שגיאה בהרצת מודל Qwen3 1.7B") }
             } finally {
                 pendingChatRequests.decrementAndGet()
             }
@@ -270,7 +286,7 @@ RULES:
                 val raw = streamMessage(
                     completion ?: throw IllegalStateException("מנוע ההשלמה אינו זמין"),
                     prompt,
-                    44
+                    64
                 )
                 val items = raw.replace("\r", "").lineSequence()
                     .map { it.trim().removePrefix("-").removePrefix("•").trim() }

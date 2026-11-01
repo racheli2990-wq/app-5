@@ -1,31 +1,32 @@
-# HELEN AI 6.0 — Qwen2.5 1.5B Bundled Offline Assistant
+# HELEN AI 7.0 — Qwen3 1.7B INT4 Offline Assistant
 
-A Hebrew-first Android personal assistant powered by **Qwen2.5-1.5B-Instruct INT8** through Google's LiteRT-LM runtime.
+HELEN is a Hebrew-first Android personal assistant powered by **Qwen3-1.7B INT4** through Google's LiteRT-LM Android runtime.
 
 ## Built-in AI model
-- The approximately **1.6 GB** Qwen2.5-1.5B INT8 LiteRT-LM model is embedded directly in the APK.
-- No separate model download is required after installing the app. During first launch, HELEN copies the packaged model from APK assets to private app storage because LiteRT-LM loads the model from a filesystem path.
-- Chat and sentence suggestions then run locally on the phone without an internet connection.
-- The app tries the GPU backend first, then falls back to CPU if GPU initialization is unavailable.
-- Published Android measurements on a Samsung S25 Ultra for the matching INT8 model reported approximately 30.9 tokens/second on GPU and 34.3 tokens/second on CPU for the 1280-token benchmark; the 4096-token model artifact used by this app measured approximately 27.3 on GPU and 26.1 on CPU. Results vary by phone.
-- Published peak memory use for the 4096-token benchmark was around 1.9 GB on GPU and 2.2 GB on CPU. A device with limited free RAM may close the app or require a different backend.
+- Model: `litert-community/Qwen3-1.7B`
+- Bundled LiteRT-LM artifact: `Qwen3-1.7B_dynamic_wi4b32_afp32.litertlm`
+- Approximate model size: **932 MB**. GitHub Actions packages it inside the APK; the app does not download a model after installation.
+- On first launch the app copies the included asset into private app storage because LiteRT-LM loads a filesystem path.
+- GPU is attempted first. This INT4 artifact is GPU-optimized.
+- If GPU initialization fails, CPU fallback is attempted. Community measurements on a Samsung Galaxy S26 report about 40.5–40.7 generated tokens/second on GPU and 8.0–8.3 tokens/second on CPU; peak CPU RSS was about 2.5 GB. These are device-specific figures, not guarantees. Devices with limited free RAM may not be suitable for CPU fallback.
+- Chat reasoning is capped at 160 tokens; sentence completion uses thinking disabled for speed.
 
 ## Features
-- Hebrew-first AI chat and AI-generated sentence completion
-- Multi-command interpretation for phone settings and app launch
+- Hebrew-first local AI chat and sentence completion
+- Quick prompts for professional writing, text summarization, translation and task planning
+- Copy the latest assistant answer, share a conversation and search recent local history
+- Start a new conversation and clear model context
+- Phone controls and app launching
 - Accessibility-assisted tap, type, scroll, read screen and screenshot (after explicit Android opt-in)
-- Reminders, alarms, timers, notes, tasks, shopping list, expenses and water tracking
-- Personal routines and local text knowledge import
-- Dark/light theme, text scaling, speech rate, chat history and model storage management
+- Reminders, alarms, timers, notes, tasks, shopping, expenses, water tracking and personal routines
+- Local text knowledge import and search
+- Dark/light theme, text scaling, speech rate and model storage management
 
-## Model provenance and license
-- Model repository: `litert-community/Qwen2.5-1.5B-Instruct`
-- Bundled file: `Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv4096.litertlm`
-- Base model: `Qwen/Qwen2.5-1.5B-Instruct`
-- The model repository declares Apache-2.0 licensing.
+## Privacy and offline operation
+Model inference and conversation history stay on the device. Internet may still be used by optional user-requested web or transit search features.
 
-## Android limits
-Wi-Fi/Bluetooth radios are handled through Android settings; phone calls and WhatsApp messages require user confirmation. Speech recognition availability depends on the device's recognition service. Some screen-control actions require explicit accessibility opt-in.
+## License and provenance
+The upstream LiteRT Community model repository declares Apache-2.0. Refer to its model card for exact details and licensing.
 
 ## Build
-GitHub Actions downloads the public model at build time, packages it into `app/src/main/assets`, builds the APK, verifies that the complete model is included and checks the APK size before publishing.
+GitHub Actions downloads the public LiteRT-LM model at build time, packages it into `app/src/main/assets`, builds the APK, verifies the model is included and enforces a GitHub Releases-friendly APK size limit.
